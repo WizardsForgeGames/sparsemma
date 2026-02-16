@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.pyo
+*.so
+*.pyd
+*.egg-info/
+dist/
+build/
+*.o
+*.obj
+*.lib
+*.exp
+*.dll
+.eggs/
+
+# Nsight Compute profiling output
+ncu_*.txt
+*.ncu-rep
+*.nsys-rep

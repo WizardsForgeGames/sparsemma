@@ -1,0 +1,157 @@
+"""
+JIT-compile sparsemma CUDA kernels.
+
+Three modules:
+  1. int8_kernels   — fused quant/dequant + cuBLAS _int_mm path
+  2. int8_gemm_tc   — custom dense INT8 Tensor Core GEMM via wmma
+  3. int8_sparse_tc — hand-rolled sparse INT8 GEMM via PTX mma.sp (2:4 structured sparsity)
+
+Auto-detects MSVC on Windows. No manual compiler setup needed.
+
+Usage:
+    from csrc.build import load_int8_kernels, load_tc_gemm, load_sparse_tc
+    tc = load_tc_gemm()
+    tc.int8_linear_tc(x, w_int8_nk, w_scale, bias)
+    sp = load_sparse_tc()
+    sp.sparse_int8_linear(x, w_comp, w_meta, w_scale, bias)
+"""
+
+import os
+import torch
+from torch.utils.cpp_extension import load
+
+_CACHED_MODULE = None
+_CACHED_TC_MODULE = None
+_CACHED_SPARSE_TC_MODULE = None
+
+# MSVC path for Windows builds (auto-detected or set via MSVC_PATH env var)
+_MSVC_PATH = os.environ.get("MSVC_PATH", "")
+
+
+def _find_msvc():
+    """Auto-detect MSVC install on Windows."""
+    if _MSVC_PATH and os.path.isdir(_MSVC_PATH):
+        return _MSVC_PATH
+    for vs_base in [
+        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
+                     "Microsoft Visual Studio"),
+        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                     "Microsoft Visual Studio"),
+    ]:
+        for edition in ["2022", "2019"]:
+            for sku in ["Community", "Professional", "Enterprise", "BuildTools"]:
+                msvc_root = os.path.join(vs_base, edition, sku, "VC", "Tools", "MSVC")
+                if os.path.isdir(msvc_root):
+                    versions = sorted(os.listdir(msvc_root), reverse=True)
+                    if versions:
+                        return os.path.join(msvc_root, versions[0])
+    return ""
+
+
+def _get_cuda_flags():
+    """Common CUDA compilation flags."""
+    extra_cflags = []
+    extra_cuda_cflags = [
+        "-O3",
+        "--use_fast_math",
+        "-gencode=arch=compute_89,code=sm_89",  # RTX 4090 (Ada Lovelace)
+        "-gencode=arch=compute_86,code=sm_86",   # RTX 3090 (Ampere)
+        "-gencode=arch=compute_80,code=sm_80",   # A100 (Ampere, needed for cp.async)
+        "--allow-unsupported-compiler",
+        "--ptxas-options=-v",
+    ]
+
+    if os.name == "nt":
+        msvc_path = _find_msvc()
+        if msvc_path:
+            cl_dir = os.path.join(msvc_path, "bin", "Hostx64", "x64")
+            if os.path.isdir(cl_dir) and cl_dir not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = cl_dir + os.pathsep + os.environ.get("PATH", "")
+
+            cl_exe = os.path.join(cl_dir, "cl.exe")
+            if os.path.isfile(cl_exe):
+                extra_cuda_cflags.append(f"-ccbin={cl_exe}")
+
+    return extra_cflags, extra_cuda_cflags
+
+
+def load_int8_kernels():
+    """Load the fused quant/dequant kernels (cuBLAS _int_mm path)."""
+    global _CACHED_MODULE
+    if _CACHED_MODULE is not None:
+        return _CACHED_MODULE
+
+    csrc_dir = os.path.dirname(os.path.abspath(__file__))
+    source = os.path.join(csrc_dir, "int8_kernels.cu")
+    extra_cflags, extra_cuda_cflags = _get_cuda_flags()
+
+    _CACHED_MODULE = load(
+        name="int8_kernels",
+        sources=[source],
+        extra_cflags=extra_cflags,
+        extra_cuda_cflags=extra_cuda_cflags,
+        verbose=True,
+    )
+    return _CACHED_MODULE
+
+
+def load_tc_gemm():
+    """Load the custom Tensor Core INT8 GEMM kernel (replaces cuBLAS _int_mm)."""
+    global _CACHED_TC_MODULE
+    if _CACHED_TC_MODULE is not None:
+        return _CACHED_TC_MODULE
+
+    csrc_dir = os.path.dirname(os.path.abspath(__file__))
+    source = os.path.join(csrc_dir, "int8_gemm_tc.cu")
+    extra_cflags, extra_cuda_cflags = _get_cuda_flags()
+
+    _CACHED_TC_MODULE = load(
+        name="int8_gemm_tc",
+        sources=[source],
+        extra_cflags=extra_cflags,
+        extra_cuda_cflags=extra_cuda_cflags,
+        verbose=True,
+    )
+    return _CACHED_TC_MODULE
+
+
+def load_sparse_tc():
+    """Load the hand-rolled sparse INT8 GEMM via PTX mma.sp (no cuSPARSELt)."""
+    global _CACHED_SPARSE_TC_MODULE
+    if _CACHED_SPARSE_TC_MODULE is not None:
+        return _CACHED_SPARSE_TC_MODULE
+
+    csrc_dir = os.path.dirname(os.path.abspath(__file__))
+    source = os.path.join(csrc_dir, "int8_sparse_tc.cu")
+    extra_cflags, extra_cuda_cflags = _get_cuda_flags()
+
+    _CACHED_SPARSE_TC_MODULE = load(
+        name="int8_sparse_tc",
+        sources=[source],
+        extra_cflags=extra_cflags,
+        extra_cuda_cflags=extra_cuda_cflags,
+        verbose=True,
+    )
+    return _CACHED_SPARSE_TC_MODULE
+
+
+if __name__ == "__main__":
+    import sys
+    target = sys.argv[1] if len(sys.argv) > 1 else "all"
+
+    if target in ("all", "kernels"):
+        print("Compiling int8_kernels...")
+        m = load_int8_kernels()
+        print(f"  {[x for x in dir(m) if not x.startswith('_')]}")
+
+    if target in ("all", "tc"):
+        print("Compiling int8_gemm_tc (Tensor Core GEMM)...")
+        m = load_tc_gemm()
+        print(f"  {[x for x in dir(m) if not x.startswith('_')]}")
+
+    if target in ("all", "sparse_tc"):
+        print("Compiling int8_sparse_tc (PTX mma.sp)...")
+        m = load_sparse_tc()
+        print(f"  {[x for x in dir(m) if not x.startswith('_')]}")
+
+    print("Done.")
