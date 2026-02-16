@@ -1,5 +1,5 @@
 """
-Setup for int8-sparse-tc: INT8 Tensor Core GEMM kernels with 2:4 Sparse TC support.
+sparsemma: INT8 Sparse Tensor Core GEMM kernels for PyTorch.
 
 Install:
     pip install .
@@ -23,10 +23,15 @@ cuda_flags = [
     "--allow-unsupported-compiler",
 ]
 
+with open("README.md", "r", encoding="utf-8") as f:
+    long_description = f.read()
+
 setup(
     name="sparsemma",
     version="0.1.0",
     description="INT8 Sparse Tensor Core GEMM kernels for PyTorch — built for Windows",
+    long_description=long_description,
+    long_description_content_type="text/markdown",
     author="WizardsForgeGames",
     url="https://github.com/WizardsForgeGames/sparsemma",
     license="MIT",
@@ -51,4 +56,27 @@ setup(
         ),
     ],
     cmdclass={"build_ext": BuildExtension},
+    classifiers=[
+        "Development Status :: 4 - Beta",
+        "Intended Audience :: Developers",
+        "Intended Audience :: Science/Research",
+        "License :: OSI Approved :: MIT License",
+        "Operating System :: Microsoft :: Windows",
+        "Operating System :: POSIX :: Linux",
+        "Programming Language :: Python :: 3",
+        "Programming Language :: C++",
+        "Programming Language :: CUDA",
+        "Topic :: Scientific/Engineering :: Artificial Intelligence",
+        "Topic :: Software Development :: Libraries :: Python Modules",
+    ],
+    keywords=[
+        "int8", "quantization", "sparse", "tensor-core", "cuda",
+        "pytorch", "gemm", "inference", "windows", "gpu",
+        "mma", "ptx", "nvidia", "ampere", "ada-lovelace",
+        "structured-sparsity", "vram", "optimization",
+    ],
+    project_urls={
+        "Bug Tracker": "https://github.com/WizardsForgeGames/sparsemma/issues",
+        "Source Code": "https://github.com/WizardsForgeGames/sparsemma",
+    },
 )
