@@ -155,7 +155,7 @@ The core kernel (`int8_sparse_tc.cu`) uses:
 - **`ldmatrix.sync.aligned.m8n8.x2` fragment loads**: hardware shared-memory-to-register transfers
 - **`cp.async` pipeline**, which overlaps global-to-shared copies with Tensor Core compute across 3–4 buffer stages
 - **XOR shared-memory swizzle**, a chunk-level permutation that avoids smem bank conflicts
-- **Persistent kernel with L2 CTA swizzle**: CTAs stay resident and loop over output tiles in an order that keeps weight tiles hot in L2
+- **Persistent kernel**: 128 CTAs stay resident and loop over output tiles in M-fastest order. (A grouped "L2 swizzle" ordering is in the code but, with the current constants, reduces to plain M-fastest order; it is not a working L2 optimization yet.)
 - **Split-K decomposition** spreads the K dimension across CTAs when there are too few output tiles to fill the SMs
 
 Launch heuristics, such as the CTA count, are tuned for the RTX 4090 (128 SMs).
