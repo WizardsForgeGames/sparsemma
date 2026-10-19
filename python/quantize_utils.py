@@ -14,8 +14,8 @@ Three compute backends (auto-selected per layer):
   3. "dequant" — Dequantize int8 weights to fp16 on-the-fly, then fp16
      matmul. Fallback for "tc" layers (M < 768 or unaligned shapes).
 
-  Note: dense layers ("tc"/"dequant") keep both an (N, K) and a (K, N) int8 copy
-  of the weight, so their weight memory is about the same as FP16.
+  Dense layers ("tc"/"dequant") store one (N, K) int8 copy plus per-channel
+  scales: 50% less weight memory than FP16.
 
 Usage:
     from python.quantize_utils import quantize_model_sparse, quantize_model_tensorcore
@@ -117,10 +117,6 @@ class Int8Linear(nn.Module):
             torch.zeros(out_features, in_features, dtype=torch.int8),
         )
         self.register_buffer(
-            "weight_int8_t",
-            torch.zeros(in_features, out_features, dtype=torch.int8),
-        )
-        self.register_buffer(
             "weight_scale",
             torch.ones(out_features, dtype=torch.float16),
         )
@@ -147,8 +143,8 @@ class Int8Linear(nn.Module):
 
         weight_int8 = (weight_f32 / scale[:, None]).round().clamp(-128, 127).to(torch.int8)
 
+        # One (N, K) copy; the dequant fallback reads it through a transposed view.
         layer.weight_int8_nk = weight_int8.contiguous()
-        layer.weight_int8_t = weight_int8.t().contiguous()
         layer.weight_scale = scale.to(torch.float16)
 
         if has_bias:
@@ -177,7 +173,6 @@ class Int8Linear(nn.Module):
         layer.weight_scale = scale.to(torch.float16)
 
         layer.register_buffer("weight_int8_nk", torch.empty(0, dtype=torch.int8))
-        layer.register_buffer("weight_int8_t", torch.empty(0, dtype=torch.int8))
 
         if has_bias:
             layer.bias = linear.bias.data.to(torch.float16)
@@ -215,7 +210,7 @@ class Int8Linear(nn.Module):
         return self._tc_ref.int8_linear_tc(x, self.weight_int8_nk, self.weight_scale, bias)
 
     def _forward_dequant(self, x: torch.Tensor) -> torch.Tensor:
-        w_fp16 = self.weight_int8_t.to(torch.float16) * self.weight_scale[None, :]
+        w_fp16 = self.weight_int8_nk.t().to(torch.float16) * self.weight_scale[None, :]
         return torch.mm(x.to(torch.float16), w_fp16)
 
     mode: str = "tc"
@@ -271,7 +266,7 @@ def quantize_model_tensorcore(model, min_features=128, verbose=True):
         print(f"  Linear params: {stats['total_params'] / 1e6:.1f}M total, "
               f"{stats['quantized_params'] / 1e6:.1f}M quantized, "
               f"{stats['skipped_params'] / 1e6:.1f}M skipped")
-        print("  Weight VRAM: ~same as FP16 (int8 weights stored in both (N,K) and (K,N) layouts)")
+        print("  Weight VRAM: ~50% less than FP16 (int8 weights + per-channel scales)")
 
     return stats
 

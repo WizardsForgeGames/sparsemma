@@ -165,7 +165,7 @@ Launch heuristics, such as the CTA count, are tuned for the RTX 4090 (128 SMs).
 | Backend | Method | When Used |
 |---|---|---|
 | `sparse` | PTX `mma.sp` (2:4 Sparse Tensor Cores) | `quantize_model_sparse()`. 69% less weight memory than FP16 |
-| `tc` | `wmma` intrinsics (Dense INT8 Tensor Cores) | `quantize_model_tensorcore()`, no pruning. Keeps two INT8 weight layouts, so weight memory is about the same as FP16 |
+| `tc` | `wmma` intrinsics (Dense INT8 Tensor Cores) | `quantize_model_tensorcore()`, no pruning. One INT8 copy plus per-channel scales: 50% less weight memory than FP16 |
 | `dequant` | INT8→FP16 on-the-fly + cuBLAS FP16 matmul | Fallback for `tc` layers when M < 768 or when the shape isn't `K % 64 == 0` / `N % 16 == 0` |
 
 ## Project Structure
