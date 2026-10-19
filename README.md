@@ -17,7 +17,7 @@ sparsemma fills that gap with an `Int8Linear` drop-in replacement for `nn.Linear
 
 ## Status
 
-This is a personal tool, built for my own projects and shared in case anyone else finds it useful. I update it when I come back to it. There are no support guarantees. The successor work, more general and actively developed, is in [Forge](https://github.com/WizardsForgeGames/Forge) (going public soon).
+This is a personal tool, built for my own projects and shared in case anyone else finds it useful. I update it when I come back to it. There are no support guarantees. The successor work, more general and actively developed, is in [Forge](https://github.com/WizardsForgeGames/Forge).
 
 ## Key Numbers
 
@@ -25,6 +25,7 @@ Measured on one RTX 4090 (see [Performance](#performance)):
 
 - **1.3–1.5x faster than cuBLAS FP16** `nn.Linear` at M >= 4096 on the four FFN shapes tested
 - **69% less weight memory** than FP16 (INT8 + 2:4 compression, including sparsity metadata)
+- All speed comparisons run a **2:4-pruned** layer against a **dense** one. They are speed at different numerics: pruning changes the layer's output, and real models need validation or pruning-aware fine-tuning (see the accuracy caveat below).
 - **No dependencies** beyond PyTorch, the CUDA toolkit, and a host C++ compiler (MSVC on Windows, auto-detected)
 
 ## Where it stands
@@ -33,6 +34,7 @@ Measured on one RTX 4090 (see [Performance](#performance)):
 - It is **4.2–5.8x faster than an unfused eager-PyTorch INT8 path** (quantize, `torch._int_mm`, dequantize) at M >= 4096, and 1.6–2.5x faster at M = 1024.
 - **cuBLASLt's dense INT8 GEMM alone (`torch._int_mm`) is faster** than the fused sparse layer: 1.4–2.6x at M >= 4096. That comparison flatters `_int_mm`, because it is given pre-quantized inputs and returns int32 with no quantize or dequantize step. Even so, sparsemma's value today is **memory savings plus a fused FP16-in/FP16-out drop-in layer**, not peak INT8 throughput.
 - At M = 1024 the sparse layer beats FP16 only on the up-projection shapes (1536x6144, 1280x5120: 1.1–1.2x). On the down-projection shapes (6144x1536, 5120x1280) it is slower than FP16.
+- Against **torchao's compiled dense INT8** (`int8_dynamic_activation_int8_weight` + `torch.compile`, triton-windows 3.4, torchao 0.7.0), the sparse layer was faster on 5 of 6 valid shape/batch pairs, e.g. 0.308 vs 0.428 ms at 1536x6144, M=4096; torchao was faster at 6144x1536, M=8192 (0.573 vs 0.674 ms). On random weights the pruned layer's relative error vs the dense layer is 0.45, versus 0.01 for torchao's dense INT8, so this is speed at different numerics.
 - The dense INT8 `tc` backend runs at 0.67–1.12x FP16 speed across these runs, so it is not a speed win over cuBLAS FP16.
 
 ## Performance
