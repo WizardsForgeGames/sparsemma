@@ -261,6 +261,80 @@ __global__ void _sp_fused_quantize_kernel(
     }
 }
 
+
+// Single-pass variant: the row stays in registers as 16-byte vectors (VPT per thread),
+// so the fp16 activation is read from memory once instead of twice, with 16-byte loads
+// and 8-byte stores. Same arithmetic as _sp_fused_quantize_kernel (bit-identical output).
+// Requires K % 8 == 0 and K <= VPT * 8 * blockDim.x. STREAM: evict-first loads, used when
+// the input is larger than L2 (it cannot stay resident, and should not flush the int8
+// output the GEMM reads next); smaller inputs use plain loads so sibling layers fed the
+// same activation (e.g. Q/K/V projections) can re-hit it in L2.
+template <int VPT, bool STREAM>
+__global__ void _sp_quantize_vec_kernel(
+    const __half* __restrict__ input,   // (M, K) fp16
+    int8_t* __restrict__ output,        // (M, K) int8
+    float* __restrict__ scales,         // (M,) fp32
+    const int K
+) {
+    const int row  = blockIdx.x;
+    const int nvec = K / 8;
+    const uint4* in_row = reinterpret_cast<const uint4*>(input + (size_t)row * K);
+    uint2* out_row = reinterpret_cast<uint2*>(output + (size_t)row * K);
+
+    uint4 v[VPT];
+    float thread_max = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < VPT; i++) {
+        const int idx = threadIdx.x + i * blockDim.x;
+        if (idx < nvec) {
+            v[i] = STREAM ? __ldcs(in_row + idx) : in_row[idx];
+            const __half2* h = reinterpret_cast<const __half2*>(&v[i]);
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const float2 f = __half22float2(h[j]);
+                thread_max = fmaxf(thread_max, fmaxf(fabsf(f.x), fabsf(f.y)));
+            }
+        }
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        thread_max = fmaxf(thread_max, __shfl_down_sync(0xffffffff, thread_max, offset));
+    __shared__ float warp_maxes[32];
+    const int warp_id = threadIdx.x / warpSize;
+    const int lane_id = threadIdx.x % warpSize;
+    if (lane_id == 0) warp_maxes[warp_id] = thread_max;
+    __syncthreads();
+    if (warp_id == 0) {
+        float val = (lane_id < (blockDim.x + warpSize - 1) / warpSize) ? warp_maxes[lane_id] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
+        if (lane_id == 0) warp_maxes[0] = val;
+    }
+    __syncthreads();
+
+    const float scale = fmaxf(warp_maxes[0], 1e-8f) / 127.0f;
+    if (threadIdx.x == 0) scales[row] = scale;
+    const float inv_scale = 1.0f / scale;
+
+    #pragma unroll
+    for (int i = 0; i < VPT; i++) {
+        const int idx = threadIdx.x + i * blockDim.x;
+        if (idx < nvec) {
+            const __half2* h = reinterpret_cast<const __half2*>(&v[i]);
+            uint32_t packed[2] = {0u, 0u};
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const float2 f = __half22float2(h[j]);
+                const int q0 = max(-128, min(127, __float2int_rn(f.x * inv_scale)));
+                const int q1 = max(-128, min(127, __float2int_rn(f.y * inv_scale)));
+                packed[j >> 1] |= ((uint32_t)(q0 & 0xFF) << (16 * (j & 1)))
+                                | ((uint32_t)(q1 & 0xFF) << (16 * (j & 1) + 8));
+            }
+            out_row[idx] = make_uint2(packed[0], packed[1]);
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Stage 3: Minimal mma.sp test kernel (single warp, single tile)
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1446,14 +1520,32 @@ std::vector<torch::Tensor> sparse_quantize_act(torch::Tensor x) {
     // Step 1: Quantize activation (M, K) fp16 → int8 + scales
     auto x_int8    = torch::empty({M, K}, torch::dtype(torch::kInt8).device(x.device()));
     auto act_scale = torch::empty({M},    torch::dtype(torch::kFloat32).device(x.device()));
-    {
+    const __half* x_ptr = reinterpret_cast<const __half*>(x.data_ptr<at::Half>());
+    const bool vec_ok = (K % 8 == 0) && (K <= 4 * 8 * 256)
+                     && (reinterpret_cast<uintptr_t>(x_ptr) % 16 == 0);
+    if (vec_ok) {
+        const int nvec    = K / 8;
+        const int threads = min(256, ((nvec + 31) / 32) * 32);
+        const int vpt     = (nvec + threads - 1) / threads;          // 1..4
+        const bool big = (size_t)M * K * sizeof(__half)
+                       > (size_t)at::cuda::getCurrentDeviceProperties()->l2CacheSize;
+        #define LAUNCH_QVEC(V) do {                                                    \
+            if (big)                                                                   \
+                _sp_quantize_vec_kernel<V, true><<<M, threads, 0, stream>>>(           \
+                    x_ptr, x_int8.data_ptr<int8_t>(), act_scale.data_ptr<float>(), K); \
+            else                                                                       \
+                _sp_quantize_vec_kernel<V, false><<<M, threads, 0, stream>>>(          \
+                    x_ptr, x_int8.data_ptr<int8_t>(), act_scale.data_ptr<float>(), K); \
+        } while (0)
+        if (vpt == 1)      LAUNCH_QVEC(1);
+        else if (vpt == 2) LAUNCH_QVEC(2);
+        else if (vpt == 3) LAUNCH_QVEC(3);
+        else               LAUNCH_QVEC(4);
+        #undef LAUNCH_QVEC
+    } else {
         const int threads = min(256, ((K + 31) / 32) * 32);
         _sp_fused_quantize_kernel<<<M, threads, 0, stream>>>(
-            reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
-            x_int8.data_ptr<int8_t>(),
-            act_scale.data_ptr<float>(),
-            K
-        );
+            x_ptr, x_int8.data_ptr<int8_t>(), act_scale.data_ptr<float>(), K);
     }
 
     return {x_int8, act_scale};
