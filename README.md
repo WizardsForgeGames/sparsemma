@@ -1,8 +1,8 @@
 # sparsemma
 
-2:4-sparse INT8 Tensor Core GEMM kernels for PyTorch, developed and tested on Windows.
+2:4-sparse INT8 Tensor Core GEMM for PyTorch on Windows, where PyTorch's own 2:4-sparse INT8 path doesn't run.
 
-## Why
+## Why this exists
 
 The goal was to get 2:4-sparse INT8 GEMM on Sparse Tensor Cores working on Windows at all, and then to optimize it toward cuBLAS. It is not meant as a cuBLAS replacement.
 
@@ -11,7 +11,7 @@ In a stock PyTorch install on Windows, the built-in 2:4 sparse path does not wor
 - CUTLASS backend: `sparse_semi_structured_mad_op : CUTLASS not supported`
 - cuSPARSELt backend: `cuSPARSELt not supported on your machine.`
 
-Dense INT8 does work on Windows through `torch._int_mm` (cuBLASLt). The gap is specifically 2:4-sparse INT8.
+The cuSPARSELt library itself supports Windows, but PyTorch's Windows wheels ship neither backend for this path. Dense INT8 does work on Windows through `torch._int_mm` (cuBLASLt), so the gap is specifically 2:4-sparse INT8.
 
 sparsemma fills that gap with an `Int8Linear` drop-in replacement for `nn.Linear` that runs on NVIDIA's Sparse Tensor Cores. Weights are quantized to INT8 and 2:4-pruned, and the layer takes FP16 in and returns FP16 out. The kernels are hand-written PTX `mma.sp` code with no dependency on cuSPARSELt or CUTLASS. They JIT-compile on first use through `torch.utils.cpp_extension`, and on Windows the build script finds MSVC by itself.
 
@@ -103,7 +103,7 @@ quantize_model_sparse(model)
 output = model(input)
 ```
 
-**Accuracy caveat:** `quantize_model_sparse` applies 2:4 magnitude pruning with no fine-tuning. That throws away half of every layer's weights and can cost real accuracy, depending on the model. Validate the quantized model on your own task before relying on it. Sparse layers need `in_features % 64 == 0` and `out_features % 16 == 0`.
+**Accuracy caveat:** `quantize_model_sparse` applies 2:4 magnitude pruning with no fine-tuning. That throws away half of every layer's weights and can cost real accuracy, depending on the model. Validate the quantized model on your own task before relying on it. Sparse layers need `in_features % 64 == 0` and `out_features % 16 == 0`. `quantize_model_sparse` leaves other layers as FP16 `nn.Linear`.
 
 ### Quantize a single layer
 
