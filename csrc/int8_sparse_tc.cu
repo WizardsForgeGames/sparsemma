@@ -96,6 +96,16 @@ __device__ __forceinline__ void cp_async_8(void* dst_smem, const void* src_gmem)
     );
 }
 
+__device__ __forceinline__ void cp_async_16_u32(uint32_t dst, const void* src) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" :: "r"(dst), "l"(src));
+}
+__device__ __forceinline__ void cp_async_16_stream_u32(uint32_t dst, const void* src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(dst), "l"(src));
+}
+__device__ __forceinline__ void cp_async_8_u32(uint32_t dst, const void* src) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" :: "r"(dst), "l"(src));
+}
+
 __device__ __forceinline__ void cp_async_commit() {
     asm volatile("cp.async.commit_group;\n" ::);
 }
@@ -466,13 +476,7 @@ __device__ __forceinline__ void sparse_gemm_impl(
     // Dynamic smem allows > 48KB (needed for 4-stage 256×128 = 64KB)
     extern __shared__ int8_t smem_raw[];
 
-    // Helper to get A/B tile pointers for a given buffer stage
-    #define SMEM_A(stage) reinterpret_cast<int8_t (*)[SP_K_COMP]>( \
-        smem_raw + (stage) * SMEM_PER_STAGE)
-    #define SMEM_B(stage) reinterpret_cast<int8_t (*)[SP_BLOCK_K]>( \
-        smem_raw + (stage) * SMEM_PER_STAGE + SMEM_A_STAGE)
-    #define SMEM_M(stage) reinterpret_cast<uint32_t (*)[2]>( \
-        smem_raw + (stage) * SMEM_PER_STAGE + SMEM_A_STAGE + SMEM_B_STAGE)
+    const uint32_t smem_base = static_cast<uint32_t>(__cvta_generic_to_shared(smem_raw));
 
     // ══════════════════════════════════════════════════════════════════
     //  Persistent tile loop: each CTA processes multiple tiles
@@ -533,59 +537,83 @@ __device__ __forceinline__ void sparse_gemm_impl(
     //  Epilogue staging reuses smem after K-loop completes.
     // ════════════════════════════════════════════════════════════════
 
-    // ── Macro: async load one K-tile (A + B) into the given smem stage ──
+    // ── Per-thread cp.async assignments, fixed for the whole tile ──
+    // Each thread copies A_ITERS 16-byte A chunks, B_ITERS 16-byte B chunks and (if
+    // t < BLOCK_WR_T) one 8-byte metadata pair per K step. Source pointers and swizzled
+    // smem offsets are computed once here; per K step only the K offset changes.
+    // Rows past N_out / M are clamped to the last valid row instead of zero-filled:
+    // they only feed output rows/columns the epilogue never stores, and clamped
+    // metadata is still a valid 2:4 pattern.
     constexpr int TOTAL_A_16 = BLOCK_WR_T * SP_K_COMP / 16;
     constexpr int TOTAL_B_16 = BLOCK_BC_T * SP_BLOCK_K / 16;
+    constexpr int A_CPR = SP_K_COMP / 16;                  // 16B chunks per A row (2)
+    constexpr int B_CPR = SP_BLOCK_K / 16;                 // 16B chunks per B row (4)
+    constexpr int A_ITERS = TOTAL_A_16 / SP_THREADS;
+    constexpr int B_ITERS = TOTAL_B_16 / SP_THREADS;
+    static_assert(TOTAL_A_16 % SP_THREADS == 0 && TOTAL_B_16 % SP_THREADS == 0,
+                  "tile loads must divide evenly across the CTA");
+    static_assert(BLOCK_WR_T <= SP_THREADS, "one metadata row per thread");
 
-    #define LOAD_TILE(STAGE, K_DENSE_OFF) do {                                \
-        const int _k_comp_off = (K_DENSE_OFF) / 2;                           \
-        auto _sA = SMEM_A(STAGE);                                            \
-        auto _sB = SMEM_B(STAGE);                                            \
-        for (int _i = t; _i < TOTAL_A_16; _i += SP_THREADS) {               \
-            const int _row  = _i / (SP_K_COMP / 16);                         \
-            const int _col4 = _i % (SP_K_COMP / 16);                         \
-            const int _gr = block_wr + _row;                                  \
-            const int _sc = a_swiz(_row, _col4 * 16);                        \
-            if (_gr < N_out)                                                  \
-                cp_async_16(&_sA[_row][_sc],                                  \
-                    W_comp + (size_t)_gr * K_comp + _k_comp_off + _col4*16);  \
-            else                                                              \
-                *reinterpret_cast<int4*>(&_sA[_row][_sc])                     \
-                    = make_int4(0,0,0,0);                                     \
-        }                                                                     \
-        for (int _i = t; _i < TOTAL_B_16; _i += SP_THREADS) {               \
-            const int _row  = _i / (SP_BLOCK_K / 16);                        \
-            const int _col4 = _i % (SP_BLOCK_K / 16);                        \
-            const int _gr = block_bc + _row;                                  \
-            const int _sc = b_swiz(_row, _col4 * 16);                        \
-            if (_gr < M)                                                      \
-                cp_async_16_stream(&_sB[_row][_sc],                           \
-                    x_int8 + (size_t)_gr * K + (K_DENSE_OFF) + _col4 * 16);  \
-            else                                                              \
-                *reinterpret_cast<int4*>(&_sB[_row][_sc])                     \
-                    = make_int4(0,0,0,0);                                     \
-        }                                                                     \
-        {   /* metadata: 8 bytes (two K/32 words) per weight row */           \
-            auto _sM = SMEM_M(STAGE);                                         \
-            for (int _r = t; _r < BLOCK_WR_T; _r += SP_THREADS) {            \
-                const int _gr = block_wr + _r;                                \
-                if (_gr < N_out)                                              \
-                    cp_async_8(&_sM[_r][0],                                   \
-                        w_meta + (size_t)_gr * meta_cols + (K_DENSE_OFF) / 32);\
-                else                                                          \
-                    *reinterpret_cast<uint2*>(&_sM[_r][0])                    \
-                        = make_uint2(0x44444444u, 0x44444444u);               \
-            }                                                                 \
-        }                                                                     \
-        cp_async_commit();                                                    \
+    const int8_t* a_src[A_ITERS];
+    uint32_t      a_dst[A_ITERS];
+    #pragma unroll
+    for (int it = 0; it < A_ITERS; it++) {
+        const int row = t / A_CPR + it * (SP_THREADS / A_CPR);
+        const int col = (t % A_CPR) * 16;
+        a_src[it] = W_comp + (size_t)min(block_wr + row, N_out - 1) * K_comp + col;
+        a_dst[it] = row * SP_K_COMP + a_swiz(row, col);
+    }
+    const int8_t* b_src[B_ITERS];
+    uint32_t      b_dst[B_ITERS];
+    #pragma unroll
+    for (int it = 0; it < B_ITERS; it++) {
+        const int row = t / B_CPR + it * (SP_THREADS / B_CPR);
+        const int col = (t % B_CPR) * 16;
+        b_src[it] = x_int8 + (size_t)min(block_bc + row, M - 1) * K + col;
+        b_dst[it] = SMEM_A_STAGE + row * SP_BLOCK_K + b_swiz(row, col);
+    }
+    const bool m_loader = (t < BLOCK_WR_T);
+    const uint32_t* m_src = w_meta + (size_t)min(block_wr + (m_loader ? t : 0), N_out - 1) * meta_cols;
+    const uint32_t  m_dst = SMEM_A_STAGE + SMEM_B_STAGE + t * 8;
+
+    // Async load of absolute K step K_ABS into the stage at smem byte offset STAGE_OFF.
+    #define LOAD_TILE(STAGE_OFF, K_ABS) do {                                      \
+        const uint32_t _so = smem_base + (STAGE_OFF);                             \
+        _Pragma("unroll")                                                          \
+        for (int _it = 0; _it < A_ITERS; _it++)                                   \
+            cp_async_16_u32(_so + a_dst[_it], a_src[_it] + (K_ABS) * SP_K_COMP);  \
+        _Pragma("unroll")                                                          \
+        for (int _it = 0; _it < B_ITERS; _it++)                                   \
+            cp_async_16_stream_u32(_so + b_dst[_it], b_src[_it] + (K_ABS) * SP_BLOCK_K); \
+        if (m_loader)                                                              \
+            cp_async_8_u32(_so + m_dst, m_src + (K_ABS) * 2);                     \
+        cp_async_commit();                                                         \
     } while (0)
 
     // ── Prologue: async load first (DB_STAGES-1) tiles ──
     // Fill all but one pipeline stage before entering the K-loop.
     // Offsets are absolute (k_start_iter + s) to handle split-K.
     #pragma unroll
-    for (int s = 0; s < DB_STAGES - 1 && s < local_K_iters; s++)
-        LOAD_TILE(s, (k_start_iter + s) * SP_BLOCK_K);
+    for (int s = 0; s < DB_STAGES - 1; s++)
+        if (s < local_K_iters)
+            LOAD_TILE(s * SMEM_PER_STAGE, k_start_iter + s);
+
+    // ── Per-lane ldmatrix / metadata offsets within a stage ──
+    // A (x2): lane L addresses row warp_wr + (L & 15); +16 rows per M-tile keeps the
+    //   swizzle phase, so M-tile mi is +mi*16*SP_K_COMP; the second K-half is ^16.
+    // B (x2): lane L addresses row warp_bc + (L & 7), K chunk ((L >> 3) & 1); +8 rows per
+    //   N-tile keeps the swizzle phase (+nj*8*SP_BLOCK_K); K[32:63] is ^32.
+    // Metadata: lane (g, tid) reads row warp_wr + g + 8*(tid&1), word tid>>1.
+    const uint32_t a_ldm_off = [&] {
+        const int row = warp_wr + (lane & 15);
+        return (uint32_t)(row * SP_K_COMP + a_swiz(row, 0));
+    }();
+    const uint32_t b_ldm_off = [&] {
+        const int row = warp_bc + (lane & 7);
+        return (uint32_t)(SMEM_A_STAGE + row * SP_BLOCK_K + b_swiz(row, ((lane >> 3) & 1) << 4));
+    }();
+    const uint32_t m_ldm_off = SMEM_A_STAGE + SMEM_B_STAGE
+        + (uint32_t)((warp_wr + groupID + ((tid & 1) << 3)) * 8 + (tid >> 1) * 4);
 
     // ── Main K-loop (over local K range) ──
     //
@@ -599,20 +627,14 @@ __device__ __forceinline__ void sparse_gemm_impl(
     //  last consumer was compute at iteration ki-(DB_STAGES-1), which completed
     //  before the sync at iteration ki-(DB_STAGES-2) at the latest.
     //
-    //  For K_iters=24 with DB_STAGES=3: 25 total syncs (24 in loop + 1 post)
-    //  instead of 48 (2×24). Halves the Wait stall at occupancy 1.
-    //
+    uint32_t comp_off  = 0;                                   // stage being computed
+    uint32_t ahead_off = (DB_STAGES - 1) * SMEM_PER_STAGE;    // stage being loaded
     for (int ki = 0; ki < local_K_iters; ki++) {
-        const int k_abs      = k_start_iter + ki;          // absolute K iteration
-        const int k_dense    = k_abs * SP_BLOCK_K;
-        const int buf_comp   = ki % DB_STAGES;
-        const int k_ahead    = ki + (DB_STAGES - 1);       // local index
+        const int  k_ahead   = ki + (DB_STAGES - 1);          // local index
         const bool has_ahead = (k_ahead < local_K_iters);
 
         // ── Wait for CURRENT tile ──
         // At most (DB_STAGES-2) commit groups may still be in flight.
-        // wait_group<DB_STAGES-2> drains all but the newest, ensuring
-        // the current buffer (committed ≥ DB_STAGES-1 iterations ago) is ready.
         if (has_ahead)
             cp_async_wait_group<DB_STAGES - 2>();
         else
@@ -620,91 +642,53 @@ __device__ __forceinline__ void sparse_gemm_impl(
         __syncthreads();
 
         // ── Initiate load (DB_STAGES-1) tiles ahead ──
-        // Placed after sync: previous compute is done, so the ahead buffer is
-        // safe to overwrite. cp.async runs concurrently with this iter's compute.
         if (has_ahead)
-            LOAD_TILE(k_ahead % DB_STAGES, (k_start_iter + k_ahead) * SP_BLOCK_K);
+            LOAD_TILE(ahead_off, k_start_iter + k_ahead);
 
-        // ── Get tile pointers for current buffer ──
-        auto cA = SMEM_A(buf_comp);
-        auto cB = SMEM_B(buf_comp);
+        const uint32_t cur = smem_base + comp_off;
 
         // ── Metadata from shared memory (staged by LOAD_TILE) ──
-        // Lane (g, tid) needs row g + 8*(tid&1), K-half tid>>1: the 32 lanes read 32
-        // consecutive words, so this is one conflict-free LDS per M-tile, no branches.
-        auto cM = SMEM_M(buf_comp);
-        uint32_t e_meta_prefetch[TILES_M];
+        // The 32 lanes read 32 consecutive words: one conflict-free LDS per M-tile.
+        uint32_t e_meta[TILES_M];
         #pragma unroll
         for (int mi = 0; mi < TILES_M; mi++)
-            e_meta_prefetch[mi] = cM[warp_wr + mi * 16 + groupID + ((tid & 1) << 3)][tid >> 1];
+            asm volatile("ld.shared.u32 %0, [%1];\n"
+                         : "=r"(e_meta[mi]) : "r"(cur + m_ldm_off + mi * 16 * 8));
 
         // ── Per-warp MMA computation ──
-        //
-        // Fragment loads use ldmatrix.sync.aligned.m8n8.x2.shared.b16. All TILES_M A
-        // fragments are loaded once per K-iteration and held in registers; the N-tile loop
-        // is outermost so each B fragment is loaded exactly once and reused across the
-        // warp's TILES_M M-tiles: 2*TILES_M + 2*TILES_N ldmatrix per K-iteration.
-        //
-        // Lane-to-address mapping for ldmatrix.x2:
-        //   Lane 0-7   → row addresses for matrix 0 (rows 0-7)
-        //   Lane 8-15  → row addresses for matrix 1 (rows 8-15)
-        //   Lane 16-31 → redundant (addresses ignored, data distributed)
-        //
+        // All TILES_M A fragments are loaded once per K step and held in registers; the
+        // N-tile loop is outermost so each B fragment is loaded exactly once and reused
+        // across the warp's TILES_M M-tiles: 2*TILES_M + 2*TILES_N ldmatrix.x2 per K step.
         uint32_t a_frag0[TILES_M][2], a_frag1[TILES_M][2];
         #pragma unroll
         for (int mi = 0; mi < TILES_M; mi++) {
-            // A fragments via ldmatrix: load m16×k16 compressed tile
-            // Lane L provides address for row (m_local + L%16), swizzled
-            const int a_ldm_row = warp_wr + mi * 16 + (lane & 15);
-            // First K-half (spsel=0): K_comp[0:15]
-            {
-                uint32_t a_addr = static_cast<uint32_t>(__cvta_generic_to_shared(
-                    &cA[a_ldm_row][a_swiz(a_ldm_row, 0)]));
-                asm volatile(
-                    "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                    : "=r"(a_frag0[mi][0]), "=r"(a_frag0[mi][1])
-                    : "r"(a_addr)
-                );
-            }
-            // Second K-half (spsel=1): K_comp[16:31]
-            {
-                uint32_t a_addr = static_cast<uint32_t>(__cvta_generic_to_shared(
-                    &cA[a_ldm_row][a_swiz(a_ldm_row, 16)]));
-                asm volatile(
-                    "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                    : "=r"(a_frag1[mi][0]), "=r"(a_frag1[mi][1])
-                    : "r"(a_addr)
-                );
-            }
+            const uint32_t a_addr = cur + a_ldm_off + mi * 16 * SP_K_COMP;
+            asm volatile(
+                "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+                : "=r"(a_frag0[mi][0]), "=r"(a_frag0[mi][1])
+                : "r"(a_addr)
+            );
+            asm volatile(
+                "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+                : "=r"(a_frag1[mi][0]), "=r"(a_frag1[mi][1])
+                : "r"(a_addr ^ 16u)
+            );
         }
 
         #pragma unroll
         for (int nj = 0; nj < TILES_N; nj++) {
-            // B fragments via ldmatrix: load k32×n8 tile as 2 × m8n8
-            // Lane L%8 selects N row; bit 3 of L selects K-half (0 or 16)
-            const int b_ldm_n = warp_bc + nj * 8 + (lane & 7);
-            const int b_k_half = ((lane >> 3) & 1) << 4;  // 0 or 16
-
-            // First B chunk (K[0:31]) and second B chunk (K[32:63])
+            const uint32_t b_addr = cur + b_ldm_off + nj * 8 * SP_BLOCK_K;
             uint32_t b_frag0[2], b_frag1[2];
-            {
-                uint32_t b_addr = static_cast<uint32_t>(__cvta_generic_to_shared(
-                    &cB[b_ldm_n][b_swiz(b_ldm_n, b_k_half)]));
-                asm volatile(
-                    "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                    : "=r"(b_frag0[0]), "=r"(b_frag0[1])
-                    : "r"(b_addr)
-                );
-            }
-            {
-                uint32_t b_addr = static_cast<uint32_t>(__cvta_generic_to_shared(
-                    &cB[b_ldm_n][b_swiz(b_ldm_n, 32 + b_k_half)]));
-                asm volatile(
-                    "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                    : "=r"(b_frag1[0]), "=r"(b_frag1[1])
-                    : "r"(b_addr)
-                );
-            }
+            asm volatile(
+                "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+                : "=r"(b_frag0[0]), "=r"(b_frag0[1])
+                : "r"(b_addr)
+            );
+            asm volatile(
+                "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+                : "=r"(b_frag1[0]), "=r"(b_frag1[1])
+                : "r"(b_addr ^ 32u)
+            );
 
             #pragma unroll
             for (int mi = 0; mi < TILES_M; mi++) {
@@ -727,10 +711,14 @@ __device__ __forceinline__ void sparse_gemm_impl(
                       "r"(b_frag1[0]), "r"(b_frag1[1]),
                       "r"(acc[mi][nj][0]), "r"(acc[mi][nj][1]),
                       "r"(acc[mi][nj][2]), "r"(acc[mi][nj][3]),
-                      "r"(e_meta_prefetch[mi])
+                      "r"(e_meta[mi])
                 );
             }
         }
+
+        // Rotate stage offsets
+        comp_off  = (comp_off  + SMEM_PER_STAGE == DB_STAGES * SMEM_PER_STAGE) ? 0 : comp_off  + SMEM_PER_STAGE;
+        ahead_off = (ahead_off + SMEM_PER_STAGE == DB_STAGES * SMEM_PER_STAGE) ? 0 : ahead_off + SMEM_PER_STAGE;
     }
 
     // Final sync: ensures all warps finished the last K-iteration's compute
@@ -788,9 +776,6 @@ __device__ __forceinline__ void sparse_gemm_impl(
     } // end persistent tile loop
 
     #undef LOAD_TILE
-    #undef SMEM_A
-    #undef SMEM_B
-    #undef SMEM_M
 }
 
 // ── Thin kernel wrappers: same body, different launch_bounds ──
