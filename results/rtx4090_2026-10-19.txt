@@ -1,0 +1,29 @@
+SparseMMA benchmark: tests/bench_vs_dense_int8.py
+Date:     2026-10-19
+GPU:      NVIDIA GeForce RTX 4090 (sm_89)
+Software: PyTorch 2.8.0+cu126, CUDA 12.6, Windows 11
+Timing:   CUDA events, median of 100 iterations after 20 warmup iterations
+TOPS:     dense-equivalent 2*M*K*N for every column (effective TOPS, directly comparable)
+
+Columns:
+  FP16 cuBLAS      nn.Linear FP16 (cuBLAS)
+  SparseMMA layer  Int8Linear sparse mode: activation quantize + 2:4 sparse INT8 mma.sp GEMM
+                   + dequant + bias, FP16 in / FP16 out
+  own dense TC     Int8Linear tc mode (this repo's dense INT8 wmma kernel)
+  _int_mm GEMM     torch._int_mm (cuBLASLt dense INT8 GEMM only): pre-quantized int8 inputs,
+                   int32 output, no quantize/dequant
+  INT8 e2e torch   eager PyTorch quantize -> torch._int_mm -> dequant + bias
+
+      K x N     M | FP16 cuBLAS | SparseMMA layer | own dense TC | _int_mm GEMM | INT8 e2e torch
+ 1536x6144   1024 |  0.128ms  151T |   0.115ms  169T |  0.139ms  139T |  0.070ms  278T |  0.252ms   77T
+ 1536x6144   4096 |  0.466ms  166T |   0.312ms  248T |  0.437ms  177T |  0.200ms  387T |  1.300ms   59T
+ 1536x6144   8192 |  0.932ms  166T |   0.609ms  254T |  0.895ms  173T |  0.387ms  400T |  2.844ms   54T
+ 6144x1536   1024 |  0.132ms  146T |   0.141ms  137T |  0.179ms  108T |  0.075ms  259T |  0.228ms   85T
+ 6144x1536   4096 |  0.478ms  162T |   0.343ms  225T |  0.518ms  149T |  0.246ms  315T |  1.833ms   42T
+ 6144x1536   8192 |  0.938ms  165T |   0.692ms  223T |  1.033ms  150T |  0.265ms  583T |  3.646ms   42T
+ 1280x5120   1024 |  0.099ms  135T |   0.084ms  160T |  0.118ms  114T |  0.052ms  257T |  0.207ms   65T
+ 1280x5120   4096 |  0.330ms  163T |   0.225ms  238T |  0.293ms  183T |  0.150ms  357T |  1.037ms   52T
+ 1280x5120   8192 |  0.648ms  166T |   0.469ms  229T |  0.649ms  165T |  0.288ms  373T |  2.296ms   47T
+ 5120x1280   1024 |  0.101ms  133T |   0.120ms  112T |  0.151ms   89T |  0.063ms  212T |  0.207ms   65T
+ 5120x1280   4096 |  0.338ms  159T |   0.258ms  208T |  0.353ms  152T |  0.175ms  307T |  1.479ms   36T
+ 5120x1280   8192 |  0.680ms  158T |   0.519ms  207T |  0.769ms  140T |  0.214ms  502T |  2.999ms   36T
