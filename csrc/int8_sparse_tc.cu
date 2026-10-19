@@ -403,6 +403,13 @@ constexpr int SP_TALL_N_THRESHOLD = 2048;
 template <int BW, int BC>
 constexpr int sp_meta_steps() { return (BC == 64) ? 1 : 4; }
 
+// Pipeline depth of the occupancy-1 kernel per tile (A+B per stage: 16 / 12 / 8 KB).
+// Total smem is padded to just over half an SM anyway (one CTA per SM, see launch).
+template <int BW, int BC>
+constexpr int sp_stages() {
+    return (BW == 256) ? 3 : (BC == 128) ? 3 : 3;
+}
+
 template <int BW, int BC, int STAGES>
 constexpr int sp_smem_bytes() {
     constexpr int MS = sp_meta_steps<BW, BC>();
@@ -872,8 +879,7 @@ __device__ __forceinline__ void sparse_gemm_impl(
 // Cap smem at 48KB to stay in 64KB config tier → preserve 64KB L1 cache.
 template <int BLOCK_WR_T, int BLOCK_BC_T>
 __global__ void sparse_gemm_kernel(SPARSE_GEMM_PARAMS) {
-    constexpr int PER_STAGE = BLOCK_WR_T * SP_K_COMP + BLOCK_BC_T * SP_BLOCK_K;
-    constexpr int STAGES = (PER_STAGE * 4 <= 48 * 1024) ? 4 : 3;
+    constexpr int STAGES = sp_stages<BLOCK_WR_T, BLOCK_BC_T>();
     sparse_gemm_impl<BLOCK_WR_T, BLOCK_BC_T, STAGES>(SPARSE_GEMM_ARGS);
 }
 
@@ -1272,8 +1278,7 @@ __global__ void sparse_gemm_warpspec_kernel(
 
 template <int BW, int BC>
 constexpr int sparse_gemm_smem_bytes() {
-    constexpr int PER_STAGE = BW * SP_K_COMP + BC * SP_BLOCK_K;
-    constexpr int STAGES = (PER_STAGE * 4 <= 48 * 1024) ? 4 : 3;
+    constexpr int STAGES = sp_stages<BW, BC>();
     constexpr int SMEM_DB = sp_smem_bytes<BW, BC, STAGES>();
     constexpr int SMEM_EPI = 8 * 16 * SP_STAGE_PAD * (int)sizeof(int32_t);
     return (SMEM_DB > SMEM_EPI) ? SMEM_DB : SMEM_EPI;
