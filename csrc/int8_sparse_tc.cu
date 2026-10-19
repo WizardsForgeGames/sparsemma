@@ -637,33 +637,29 @@ __device__ __forceinline__ void sparse_gemm_impl(
 
         // ── Per-warp MMA computation ──
         //
-        // Fragment loads use ldmatrix.sync.aligned.m8n8.x2.shared.b16:
-        //   - One instruction loads both halves of an m16 tile (rows 0-7 + 8-15)
-        //   - Hardware-optimized shared memory access (bank-conflict-free)
-        //   - 72 ldmatrix per K-iter vs 144 manual loads (50% fewer instructions)
+        // Fragment loads use ldmatrix.sync.aligned.m8n8.x2.shared.b16. All TILES_M A
+        // fragments are loaded once per K-iteration and held in registers; the N-tile loop
+        // is outermost so each B fragment is loaded exactly once and reused across the
+        // warp's TILES_M M-tiles: 2*TILES_M + 2*TILES_N ldmatrix per K-iteration.
         //
         // Lane-to-address mapping for ldmatrix.x2:
         //   Lane 0-7   → row addresses for matrix 0 (rows 0-7)
         //   Lane 8-15  → row addresses for matrix 1 (rows 8-15)
         //   Lane 16-31 → redundant (addresses ignored, data distributed)
         //
+        uint32_t a_frag0[TILES_M][2], a_frag1[TILES_M][2];
         #pragma unroll
         for (int mi = 0; mi < TILES_M; mi++) {
-            const int m_local = warp_wr + mi * 16;
-            const uint32_t e_meta = e_meta_prefetch[mi];
-
             // A fragments via ldmatrix: load m16×k16 compressed tile
             // Lane L provides address for row (m_local + L%16), swizzled
-            const int a_ldm_row = m_local + (lane & 15);
-            uint32_t a_frag0[2], a_frag1[2];
-
+            const int a_ldm_row = warp_wr + mi * 16 + (lane & 15);
             // First K-half (spsel=0): K_comp[0:15]
             {
                 uint32_t a_addr = static_cast<uint32_t>(__cvta_generic_to_shared(
                     &cA[a_ldm_row][a_swiz(a_ldm_row, 0)]));
                 asm volatile(
                     "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                    : "=r"(a_frag0[0]), "=r"(a_frag0[1])
+                    : "=r"(a_frag0[mi][0]), "=r"(a_frag0[mi][1])
                     : "r"(a_addr)
                 );
             }
@@ -673,30 +669,43 @@ __device__ __forceinline__ void sparse_gemm_impl(
                     &cA[a_ldm_row][a_swiz(a_ldm_row, 16)]));
                 asm volatile(
                     "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                    : "=r"(a_frag1[0]), "=r"(a_frag1[1])
+                    : "=r"(a_frag1[mi][0]), "=r"(a_frag1[mi][1])
                     : "r"(a_addr)
+                );
+            }
+        }
+
+        #pragma unroll
+        for (int nj = 0; nj < TILES_N; nj++) {
+            // B fragments via ldmatrix: load k32×n8 tile as 2 × m8n8
+            // Lane L%8 selects N row; bit 3 of L selects K-half (0 or 16)
+            const int b_ldm_n = warp_bc + nj * 8 + (lane & 7);
+            const int b_k_half = ((lane >> 3) & 1) << 4;  // 0 or 16
+
+            // First B chunk (K[0:31]) and second B chunk (K[32:63])
+            uint32_t b_frag0[2], b_frag1[2];
+            {
+                uint32_t b_addr = static_cast<uint32_t>(__cvta_generic_to_shared(
+                    &cB[b_ldm_n][b_swiz(b_ldm_n, b_k_half)]));
+                asm volatile(
+                    "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+                    : "=r"(b_frag0[0]), "=r"(b_frag0[1])
+                    : "r"(b_addr)
+                );
+            }
+            {
+                uint32_t b_addr = static_cast<uint32_t>(__cvta_generic_to_shared(
+                    &cB[b_ldm_n][b_swiz(b_ldm_n, 32 + b_k_half)]));
+                asm volatile(
+                    "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+                    : "=r"(b_frag1[0]), "=r"(b_frag1[1])
+                    : "r"(b_addr)
                 );
             }
 
             #pragma unroll
-            for (int nj = 0; nj < TILES_N; nj++) {
-                // B fragments via ldmatrix: load k32×n8 tile as 2 × m8n8
-                // Lane L%8 selects N row; bit 3 of L selects K-half (0 or 16)
-                const int b_ldm_n = warp_bc + nj * 8 + (lane & 7);
-                const int b_k_half = ((lane >> 3) & 1) << 4;  // 0 or 16
-
-                // First B chunk (K[0:31]): two 16-byte K-halves via ldmatrix.x2
-                uint32_t b_frag0[2];
-                {
-                    uint32_t b_addr = static_cast<uint32_t>(__cvta_generic_to_shared(
-                        &cB[b_ldm_n][b_swiz(b_ldm_n, b_k_half)]));
-                    asm volatile(
-                        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                        : "=r"(b_frag0[0]), "=r"(b_frag0[1])
-                        : "r"(b_addr)
-                    );
-                }
-
+            for (int mi = 0; mi < TILES_M; mi++) {
+                const uint32_t e_meta = e_meta_prefetch[mi];
                 // MMA 1: spsel=0, K[0:31]
                 asm volatile(
                     "mma.sp.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
@@ -707,25 +716,12 @@ __device__ __forceinline__ void sparse_gemm_impl(
                     "%12, 0x0;\n"
                     : "=r"(acc[mi][nj][0]), "=r"(acc[mi][nj][1]),
                       "=r"(acc[mi][nj][2]), "=r"(acc[mi][nj][3])
-                    : "r"(a_frag0[0]), "r"(a_frag0[1]),
+                    : "r"(a_frag0[mi][0]), "r"(a_frag0[mi][1]),
                       "r"(b_frag0[0]), "r"(b_frag0[1]),
                       "r"(acc[mi][nj][0]), "r"(acc[mi][nj][1]),
                       "r"(acc[mi][nj][2]), "r"(acc[mi][nj][3]),
                       "r"(e_meta)
                 );
-
-                // Second B chunk (K[32:63]): two 16-byte K-halves via ldmatrix.x2
-                uint32_t b_frag1[2];
-                {
-                    uint32_t b_addr = static_cast<uint32_t>(__cvta_generic_to_shared(
-                        &cB[b_ldm_n][b_swiz(b_ldm_n, 32 + b_k_half)]));
-                    asm volatile(
-                        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                        : "=r"(b_frag1[0]), "=r"(b_frag1[1])
-                        : "r"(b_addr)
-                    );
-                }
-
                 // MMA 2: spsel=1, K[32:63]
                 asm volatile(
                     "mma.sp.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
@@ -736,7 +732,7 @@ __device__ __forceinline__ void sparse_gemm_impl(
                     "%12, 0x1;\n"
                     : "=r"(acc[mi][nj][0]), "=r"(acc[mi][nj][1]),
                       "=r"(acc[mi][nj][2]), "=r"(acc[mi][nj][3])
-                    : "r"(a_frag1[0]), "r"(a_frag1[1]),
+                    : "r"(a_frag1[mi][0]), "r"(a_frag1[mi][1]),
                       "r"(b_frag1[0]), "r"(b_frag1[1]),
                       "r"(acc[mi][nj][0]), "r"(acc[mi][nj][1]),
                       "r"(acc[mi][nj][2]), "r"(acc[mi][nj][3]),
