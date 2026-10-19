@@ -1,8 +1,19 @@
 # sparsemma
 
-INT8 Sparse Tensor Core GEMM kernels for PyTorch, developed and tested on Windows.
+2:4-sparse INT8 Tensor Core GEMM kernels for PyTorch, developed and tested on Windows.
 
-sparsemma provides an `Int8Linear` drop-in replacement for `nn.Linear` that runs on NVIDIA's Sparse Tensor Cores: weights are quantized to INT8 and 2:4-pruned, activations stay FP16 in and FP16 out. The kernels are hand-written PTX `mma.sp` code with no dependency on cuSPARSELt or CUTLASS. They JIT-compile on first use through `torch.utils.cpp_extension`, and on Windows the build script finds MSVC by itself.
+## Why
+
+The goal was to get 2:4-sparse INT8 GEMM on Sparse Tensor Cores working on Windows at all, and then to optimize it toward cuBLAS. It is not meant as a cuBLAS replacement.
+
+In a stock PyTorch install on Windows, the built-in 2:4 sparse path does not work for int8. On Windows 11 with PyTorch 2.8.0+cu126, `torch.sparse.to_sparse_semi_structured` on an int8 tensor fails with both of its backends:
+
+- CUTLASS backend: `sparse_semi_structured_mad_op : CUTLASS not supported`
+- cuSPARSELt backend: `cuSPARSELt not supported on your machine.`
+
+Dense INT8 does work on Windows through `torch._int_mm` (cuBLASLt). The gap is specifically 2:4-sparse INT8.
+
+sparsemma fills that gap with an `Int8Linear` drop-in replacement for `nn.Linear` that runs on NVIDIA's Sparse Tensor Cores. Weights are quantized to INT8 and 2:4-pruned, and the layer takes FP16 in and returns FP16 out. The kernels are hand-written PTX `mma.sp` code with no dependency on cuSPARSELt or CUTLASS. They JIT-compile on first use through `torch.utils.cpp_extension`, and on Windows the build script finds MSVC by itself.
 
 ## Status
 
