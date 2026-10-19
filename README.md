@@ -200,6 +200,8 @@ sparsemma/
   setup.py
 ```
 
+**If a kernel fails to build**, `Int8Linear` falls back to a slower path and prints a boxed warning naming the kernel and the error (once per process). Set `INT8_KERNELS_STRICT=1` to make that an error instead. On Windows with a non-UTF-8 code page, older PyTorch versions can fail to read kernel sources; the sources are ASCII-only for that reason, and `PYTHONUTF8=1` also avoids it.
+
 ## Running Tests
 
 ```bash
