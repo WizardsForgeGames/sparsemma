@@ -1,52 +1,74 @@
 # sparsemma
 
-INT8 Sparse Tensor Core GEMM kernels for PyTorch — **built for Windows**.
+INT8 Sparse Tensor Core GEMM kernels for PyTorch, developed and tested on Windows.
 
-Most INT8 / sparse inference libraries assume Linux. cuSPARSELt doesn't ship Windows builds. CUTLASS needs CMake gymnastics. TensorRT is a whole ecosystem. If you're on Windows with an NVIDIA GPU and just want fast INT8 inference in PyTorch, your options are... limited.
+sparsemma provides an `Int8Linear` drop-in replacement for `nn.Linear` that runs on NVIDIA's Sparse Tensor Cores: weights are quantized to INT8 and 2:4-pruned, activations stay FP16 in and FP16 out. The kernels are hand-written PTX `mma.sp` code with no dependency on cuSPARSELt or CUTLASS. They JIT-compile on first use through `torch.utils.cpp_extension`, and on Windows the build script finds MSVC by itself.
 
-**sparsemma fixes that.** One pip install, auto-detects your MSVC compiler, JIT-compiles the kernels, and drops into any PyTorch model. No build system to fight. No Linux-only dependencies. Just `quantize_model_sparse(model)` and go.
+## Status
 
-Under the hood, it's hand-rolled PTX `mma.sp` instructions driving Sparse Tensor Cores directly — the same hardware path that cuSPARSELt uses on Linux, but implemented from scratch with zero external dependencies.
+This is a personal tool, built for my own projects and shared in case anyone else finds it useful. I update it when I come back to it. There are no support guarantees. The successor work, more general and actively developed, is in [Forge](https://github.com/WizardsForgeGames/Forge) (going public soon).
 
 ## Key Numbers
 
-- **263 TOPS** on RTX 4090 — 1.5x faster than FP16 at large batch sizes
-- **75% weight VRAM savings** — INT8 quantization + 2:4 sparsity compression
-- **One line** to quantize a model — `quantize_model_sparse(model)`
-- **Zero dependencies** beyond PyTorch + CUDA toolkit
-- **Windows + Linux** — auto-detects MSVC, works out of the box on both
+Measured on one RTX 4090 (see [Performance](#performance)):
+
+- **1.3–1.5x faster than cuBLAS FP16** `nn.Linear` at M >= 4096 on the four FFN shapes tested
+- **69% less weight memory** than FP16 (INT8 + 2:4 compression, including sparsity metadata)
+- **No dependencies** beyond PyTorch, the CUDA toolkit, and a host C++ compiler (MSVC on Windows, auto-detected)
+
+## Where it stands
+
+- The fused sparse layer is **1.3–1.5x faster than cuBLAS FP16** at M >= 4096 and stores weights in **69% less memory**.
+- It is **4.2–5.8x faster than an unfused eager-PyTorch INT8 path** (quantize, `torch._int_mm`, dequantize) at M >= 4096, and 1.6–2.5x faster at M = 1024.
+- **cuBLASLt's dense INT8 GEMM alone (`torch._int_mm`) is faster** than the fused sparse layer: 1.4–2.6x at M >= 4096. That comparison flatters `_int_mm`, because it is given pre-quantized inputs and returns int32 with no quantize or dequantize step. Even so, sparsemma's value today is **memory savings plus a fused FP16-in/FP16-out drop-in layer**, not peak INT8 throughput.
+- At M = 1024 the sparse layer beats FP16 only on the up-projection shapes (1536x6144, 1280x5120: 1.1–1.2x). On the down-projection shapes (6144x1536, 5120x1280) it is slower than FP16.
+- The dense INT8 `tc` backend runs at 0.67–1.12x FP16 speed across these runs, so it is not a speed win over cuBLAS FP16.
 
 ## Performance
 
-RTX 4090, M=4096 (large batch), median of 50 iterations:
+**Hardware/software:** RTX 4090 (sm_89), PyTorch 2.8.0+cu126, CUDA 12.6, Windows 11.
+**Method:** CUDA events, median of 100 iterations after 20 warmup iterations ([`tests/bench_vs_dense_int8.py`](tests/bench_vs_dense_int8.py)).
+**TOPS** are *effective (dense-equivalent) TOPS*: 2·M·K·N divided by time, for every column. The sparse kernel does half the multiply-adds, so its effective TOPS can exceed what it physically executes. The columns are directly comparable.
 
-| Layer Shape | FP16 | Sparse INT8 | Speedup | VRAM Saved |
-|---|---|---|---|---|
-| 1536 x 6144 (DINOv2 FFN) | 174 TOPS | **263 TOPS** | **1.51x** | 69% |
-| 1280 x 5120 (UNet FFN) | 157 TOPS | **222 TOPS** | **1.42x** | 69% |
-| 6144 x 1536 | 168 TOPS | **232 TOPS** | **1.38x** | 69% |
-| 5120 x 1280 | 156 TOPS | **203 TOPS** | **1.30x** | 69% |
-| 1280 x 1280 | 139 TOPS | **164 TOPS** | **1.18x** | 69% |
-| 1024 x 1024 | 158 TOPS | **179 TOPS** | **1.13x** | 69% |
+Effective TOPS (latency in ms):
 
-Sparse INT8 is fastest on large layers with large batch sizes (M >= 1024, K >= 1024). For small layers or small batches, FP16 can be faster due to kernel launch overhead.
+| K x N | M | FP16 cuBLAS | **SparseMMA layer** | own dense TC | `_int_mm` GEMM only¹ | INT8 e2e eager² |
+|---|---|---|---|---|---|---|
+| 1536 x 6144 | 4096 | 166 (0.466) | **248 (0.312)** | 177 (0.437) | 387 (0.200) | 59 (1.300) |
+| 1536 x 6144 | 8192 | 166 (0.932) | **254 (0.609)** | 173 (0.895) | 400 (0.387) | 54 (2.844) |
+| 6144 x 1536 | 4096 | 162 (0.478) | **225 (0.343)** | 149 (0.518) | 315 (0.246) | 42 (1.833) |
+| 6144 x 1536 | 8192 | 165 (0.938) | **223 (0.692)** | 150 (1.033) | 583 (0.265) | 42 (3.646) |
+| 1280 x 5120 | 4096 | 163 (0.330) | **238 (0.225)** | 183 (0.293) | 357 (0.150) | 52 (1.037) |
+| 1280 x 5120 | 8192 | 166 (0.648) | **229 (0.469)** | 165 (0.649) | 373 (0.288) | 47 (2.296) |
+| 5120 x 1280 | 4096 | 159 (0.338) | **208 (0.258)** | 152 (0.353) | 307 (0.175) | 36 (1.479) |
+| 5120 x 1280 | 8192 | 158 (0.680) | **207 (0.519)** | 140 (0.769) | 502 (0.214) | 36 (2.999) |
+
+- **SparseMMA layer:** `Int8Linear` in sparse mode. Activation quantize kernel, then the 2:4 sparse INT8 `mma.sp` GEMM with dequant and bias in its epilogue. FP16 in, FP16 out.
+- ¹ `torch._int_mm`: cuBLASLt dense INT8 GEMM only. Pre-quantized int8 inputs, int32 output, no quantize/dequant.
+- ² Eager PyTorch: quantize, then `torch._int_mm`, then dequant + bias, as separate ops.
+
+The full run, including the M = 1024 rows, is in [`results/rtx4090_2026-10-19.txt`](results/rtx4090_2026-10-19.txt).
+
+**Weight memory:** the sparse layout stores 0.5 bytes/weight of INT8 values plus 0.125 bytes/weight of 2:4 metadata (plus one FP16 scale per output channel). That is 69% less than FP16's 2 bytes/weight. The theoretical 75% figure (INT8 × 50% sparsity) applies only before metadata and scales are counted.
 
 ## Requirements
 
 - Python 3.8+
-- PyTorch 2.0+ with CUDA support
-- CUDA Toolkit 11.8+ (for `sm_80`+)
-- NVIDIA GPU with Sparse Tensor Cores: Ampere (RTX 3090, A100) or Ada Lovelace (RTX 4090)
-- **Windows**: Visual Studio 2019/2022 with C++ build tools (auto-detected)
-- **Linux**: GCC compatible with your CUDA version
+- PyTorch with CUDA support (tested: 2.8.0+cu126; `setup.py` declares `torch>=2.0`, but older versions are untested)
+- CUDA Toolkit 11.8+ (needed to compile for `sm_89`; tested: 12.6)
+- NVIDIA GPU with Sparse Tensor Cores (Ampere or newer). Only the RTX 4090 has been tested; see [Target Hardware](#target-hardware)
+- **Windows**: Visual Studio 2019/2022 with C++ build tools. Auto-detected from the default install locations, or set `MSVC_PATH`
+- **Linux**: GCC compatible with your CUDA version (untested)
 
 ## Installation
 
 ```bash
-pip install -e .
+git clone https://github.com/WizardsForgeGames/sparsemma
+cd sparsemma
+pip install -e . --no-build-isolation   # setup.py imports torch at build time
 ```
 
-Or use the JIT compiler directly (no install needed):
+You can also skip installation and run from the repo root. The Python API JIT-compiles the kernels on first use and caches them afterwards:
 
 ```python
 from csrc.build import load_sparse_tc
@@ -55,20 +77,22 @@ sp = load_sparse_tc()  # compiles on first call, cached after
 
 ## Quick Start
 
-### Quantize a whole model (one line)
+### Quantize a whole model
 
 ```python
 from python.quantize_utils import quantize_model_sparse
 
-model = load_your_model()  # any PyTorch model with nn.Linear layers
+model = load_your_model()  # any PyTorch model with nn.Linear layers (FP16, on CUDA)
 quantize_model_sparse(model)
 
-# That's it. All eligible Linear layers are now:
-#   - INT8 quantized (per-channel)
-#   - 2:4 pruned (50% structured sparsity)
+# Linear layers with in_features >= 640 (and both dims >= 128) are now:
+#   - INT8 quantized (per output channel)
+#   - 2:4 pruned (50% structured sparsity, magnitude-based)
 #   - Running on Sparse Tensor Cores
 output = model(input)
 ```
+
+**Accuracy caveat:** `quantize_model_sparse` applies 2:4 magnitude pruning with no fine-tuning. That throws away half of every layer's weights and can cost real accuracy, depending on the model. Validate the quantized model on your own task before relying on it. Sparse layers need `in_features % 64 == 0` and `out_features % 16 == 0`.
 
 ### Quantize a single layer
 
@@ -101,63 +125,71 @@ output = sp.sparse_int8_linear(x, compressed, metadata, weight_scale, bias)
 
 ### 2:4 Structured Sparsity
 
-For every group of 4 values along the K dimension, the two smallest-magnitude values are pruned to zero. This creates a **2:4 pattern** that NVIDIA's Sparse Tensor Cores execute natively at 2x throughput:
+For every group of 4 values along the K dimension, the two smallest-magnitude values are pruned to zero. The result is a **2:4 pattern**, which NVIDIA's Sparse Tensor Cores execute natively at up to 2x the dense peak math rate:
 
 ```
 Original:   [10, 1, 20, 2]  →  keep [10, 20], prune [1, 2]
 Compressed: [10, 20]  +  metadata: indices (0, 2)
 ```
 
-The weight matrix shrinks to half its original size. Combined with INT8 quantization (another 2x), total weight memory is **25% of FP16**.
+The stored values shrink to half the dense size. Combined with INT8 quantization, the values take 25% of FP16's memory. Once the 2:4 metadata is added, the total is 31% of FP16, a 69% saving.
 
 ### The Kernel
 
 The core kernel (`int8_sparse_tc.cu`) uses:
 
-- **PTX `mma.sp.sync.aligned.m16n8k32` instructions** — direct Sparse Tensor Core access without cuSPARSELt overhead
-- **`ldmatrix.sync.aligned.m8n8.x2` fragment loads** — hardware-optimized shared memory to register transfer
-- **`cp.async` pipeline** — overlaps global-to-shared memory copies with Tensor Core compute across 3-4 buffer stages
-- **XOR bank-conflict-free shared memory swizzle** — chunk-level permutation eliminates smem bank conflicts
-- **Persistent kernel with L2 CTA swizzle** — tiles stay resident on SMs, weight data stays hot in L2 cache
-- **Split-K decomposition** — distributes large K dimensions across CTAs for better SM utilization
+- **PTX `mma.sp.sync.aligned.m16n8k32` instructions** for direct Sparse Tensor Core access, with no cuSPARSELt dependency
+- **`ldmatrix.sync.aligned.m8n8.x2` fragment loads**: hardware shared-memory-to-register transfers
+- **`cp.async` pipeline**, which overlaps global-to-shared copies with Tensor Core compute across 3–4 buffer stages
+- **XOR shared-memory swizzle**, a chunk-level permutation that avoids smem bank conflicts
+- **Persistent kernel with L2 CTA swizzle**: CTAs stay resident and loop over output tiles in an order that keeps weight tiles hot in L2
+- **Split-K decomposition** spreads the K dimension across CTAs when there are too few output tiles to fill the SMs
+
+Launch heuristics, such as the CTA count, are tuned for the RTX 4090 (128 SMs).
 
 ### Three Compute Backends
 
 | Backend | Method | When Used |
 |---|---|---|
-| `sparse` | PTX `mma.sp` (2:4 Sparse Tensor Cores) | `quantize_model_sparse()` — best throughput + VRAM |
-| `tc` | `wmma` intrinsics (Dense INT8 Tensor Cores) | `quantize_model_tensorcore()` — no pruning |
-| `dequant` | INT8→FP16 on-the-fly + cuBLAS FP16 matmul | Automatic fallback for small layers |
+| `sparse` | PTX `mma.sp` (2:4 Sparse Tensor Cores) | `quantize_model_sparse()`. 69% less weight memory than FP16 |
+| `tc` | `wmma` intrinsics (Dense INT8 Tensor Cores) | `quantize_model_tensorcore()`, no pruning. Keeps two INT8 weight layouts, so weight memory is about the same as FP16 |
+| `dequant` | INT8→FP16 on-the-fly + cuBLAS FP16 matmul | Fallback for `tc` layers when M < 768 or when the shape isn't `K % 64 == 0` / `N % 16 == 0` |
 
 ## Project Structure
 
 ```
 sparsemma/
   csrc/
-    int8_sparse_tc.cu    # Sparse INT8 GEMM — hand-rolled PTX mma.sp kernel
-    int8_gemm_tc.cu      # Dense INT8 GEMM — wmma-based Tensor Core kernel
-    int8_kernels.cu      # Fused quantize/dequantize helper kernels
-    build.py             # JIT compilation (auto-detects MSVC on Windows)
+    int8_sparse_tc.cu      # Sparse INT8 GEMM: hand-rolled PTX mma.sp kernel
+    int8_gemm_tc.cu        # Dense INT8 GEMM: wmma-based Tensor Core kernel
+    int8_kernels.cu        # Fused quantize/dequantize helper kernels
+    build.py               # JIT compilation (auto-detects MSVC on Windows)
   python/
-    quantize_utils.py    # Int8Linear module + quantize_model_* APIs
+    quantize_utils.py      # Int8Linear module + quantize_model_* APIs
   tests/
-    test_sparse_tc.py    # Correctness tests (10 steps)
-    benchmark.py         # FP16 vs Sparse INT8 vs Dense INT8 benchmarks
-    profile_sparse.py    # Nsight Compute profiling script
+    test_sparse_tc.py      # Correctness tests (pytest)
+    bench_vs_dense_int8.py # FP16 vs sparse vs dense INT8 baselines (table above)
+    benchmark.py           # FP16 vs Sparse INT8 vs Dense INT8, with VRAM
+    profile_sparse.py      # Nsight Compute profiling script
+  results/                 # Recorded benchmark runs
   setup.py
 ```
 
 ## Running Tests
 
 ```bash
-# Correctness (all 10 tests)
-python tests/test_sparse_tc.py
+# Correctness
+python -m pytest tests/test_sparse_tc.py -v
 
-# Benchmark
+# Sparse vs dense micro-benchmark (from the test file)
+python tests/test_sparse_tc.py --bench
+
+# Comparison against FP16 and dense INT8 baselines (the table above)
+python tests/bench_vs_dense_int8.py
+
+# Benchmark with VRAM measurements
 python tests/benchmark.py
-
-# Benchmark without sparse (dense INT8 + FP16 only)
-python tests/benchmark.py --no-sparse
+python tests/benchmark.py --no-sparse   # dense INT8 + FP16 only
 
 # Profile with Nsight Compute
 ncu --set full -o sparse_profile python tests/profile_sparse.py
@@ -165,14 +197,17 @@ ncu --set full -o sparse_profile python tests/profile_sparse.py
 
 ## Target Hardware
 
-Sparse Tensor Cores require Ampere or newer:
+Sparse Tensor Cores require Ampere or newer. The build targets `sm_80`, `sm_86` and `sm_89`.
 
 | GPU | Architecture | Compute Capability | Status |
 |---|---|---|---|
-| RTX 4090 / 4080 / 4070 | Ada Lovelace | sm_89 | Tested |
-| RTX 3090 / 3080 / 3070 | Ampere | sm_86 | Supported |
-| A100 / A6000 | Ampere | sm_80 | Supported |
-| RTX 2080 / V100 | Turing / Volta | sm_75 / sm_70 | Not supported (no Sparse TC) |
+| RTX 4090 | Ada Lovelace | sm_89 | **Tested** (Windows 11) |
+| RTX 4080 / 4070 | Ada Lovelace | sm_89 | Untested |
+| RTX 3090 / 3080 / 3070 | Ampere | sm_86 | Untested |
+| A100 / A6000 | Ampere | sm_80 / sm_86 | Untested |
+| RTX 2080 / V100 | Turing / Volta | sm_75 / sm_70 | Not supported (no Sparse Tensor Cores) |
+
+Linux builds are untested.
 
 ## License
 

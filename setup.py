@@ -32,7 +32,7 @@ setup(
     description="INT8 Sparse Tensor Core GEMM kernels for PyTorch — built for Windows",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    author="WizardsForgeGames",
+    author="Darren Sander",
     url="https://github.com/WizardsForgeGames/sparsemma",
     license="MIT",
     python_requires=">=3.8",
