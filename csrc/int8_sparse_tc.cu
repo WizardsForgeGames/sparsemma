@@ -497,10 +497,6 @@ __device__ __forceinline__ void sparse_gemm_impl(
     const int spatial_tiles = tiles_x * tiles_y;
     const int total_tiles = spatial_tiles * split_k;
 
-    // L2 swizzle: group SWIZZLE_W N-tiles, sweep M-tiles column-major
-    // within each group. Weight tiles (A) stay hot across M-tile sweep.
-    constexpr int SWIZZLE_W = 4;
-
     // ── Shared memory (persists across tile iterations) ──
     // Dynamic smem allows > 48KB (needed for 4-stage 256×128 = 64KB)
     extern __shared__ int8_t smem_raw[];
@@ -524,19 +520,12 @@ __device__ __forceinline__ void sparse_gemm_impl(
     const int k_split_id = tile_id / spatial_tiles;
     const int spatial_id = tile_id % spatial_tiles;
 
-    // ── L2 CTA swizzle: spatial_id → (tile_n, tile_m) ──
-    int tile_n, tile_m;
-    if (tiles_x >= 2 * SWIZZLE_W) {
-        const int group_tiles = SWIZZLE_W * tiles_y;
-        const int group_id    = spatial_id / group_tiles;
-        const int within      = spatial_id % group_tiles;
-        tile_n = (within / tiles_y) + group_id * SWIZZLE_W;
-        tile_m = within % tiles_y;
-        if (tile_n >= tiles_x) continue;  // partial last group
-    } else {
-        tile_n = spatial_id % tiles_x;
-        tile_m = spatial_id / tiles_x;
-    }
+    // ── Tile order: spatial_id → (tile_n, tile_m) ──
+    // M-fastest: consecutive tiles of a CTA (block-partitioned) share the weight tile,
+    // and co-running CTAs mostly share weight rows. Measured faster than N-fastest and
+    // than banded/grouped orders on the headline shapes.
+    const int tile_n = spatial_id / tiles_y;
+    const int tile_m = spatial_id % tiles_y;
 
     // ── K-range for this split ──
     const int k_start_iter  = k_split_id * k_iters_per_split;
