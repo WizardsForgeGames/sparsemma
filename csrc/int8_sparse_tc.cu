@@ -394,6 +394,22 @@ constexpr int SP_WIDE_M_THRESHOLD = 2048;
 // At BLOCK_WR=256, need N_out >= 8*256=2048 for good occupancy on 128 SMs.
 constexpr int SP_TALL_N_THRESHOLD = 2048;
 
+// Sparsity metadata staging (2 uint32 per weight row per 64-deep K step):
+//   META_STEPS = 1: 8 bytes per row in every pipeline stage. 8 useful bytes per 32-byte
+//                   L2 sector, but the cheapest loop; best for the small 128x64 tile, which
+//                   is barrier/latency-bound rather than L2-bound.
+//   META_STEPS = 4: 32 bytes (4 K steps) per row into a 2-slot ring every 4th K step: full
+//                   sectors, ~25% less L2 traffic for the large, L2-bound tiles.
+template <int BW, int BC>
+constexpr int sp_meta_steps() { return (BC == 64) ? 1 : 4; }
+
+template <int BW, int BC, int STAGES>
+constexpr int sp_smem_bytes() {
+    constexpr int MS = sp_meta_steps<BW, BC>();
+    constexpr int PER_STAGE = BW * SP_K_COMP + BC * SP_BLOCK_K + (MS == 1 ? BW * 8 : 0);
+    return STAGES * PER_STAGE + (MS == 1 ? 0 : 2 * BW * MS * 8);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Split-K finalization: sum fp32 workspace partials → fp16 output + bias
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -433,13 +449,19 @@ __device__ __forceinline__ void sparse_gemm_impl(
     constexpr int TILES_N = WARP_BC / 8;                     // 4 or 8
     constexpr int DB_STAGES = DB_STAGES_T;
 
-    // Pipelined smem: DB_STAGES × (A_tile + B_tile)
+    // Pipelined smem: DB_STAGES × (A_tile + B_tile), then a 2-slot metadata ring
     constexpr int SMEM_A_STAGE = BLOCK_WR_T * SP_K_COMP;             // 4096 or 8192
     constexpr int SMEM_B_STAGE = BLOCK_BC_T * SP_BLOCK_K;            // 4096 or 8192
-    // Sparsity metadata: 2 uint32 per weight row per 64-deep K step (K[0:31], K[32:63])
-    constexpr int SMEM_M_STAGE = BLOCK_WR_T * 2 * (int)sizeof(uint32_t);
+    // Sparsity metadata: see sp_meta_steps (per-stage slot, or a 2-slot 4-step ring)
+    constexpr int META_STEPS   = sp_meta_steps<BLOCK_WR_T, BLOCK_BC_T>();
+    constexpr int SMEM_M_STAGE = (META_STEPS == 1) ? BLOCK_WR_T * 8 : 0;
     constexpr int SMEM_PER_STAGE = SMEM_A_STAGE + SMEM_B_STAGE + SMEM_M_STAGE;
-    constexpr int SMEM_DB = DB_STAGES * SMEM_PER_STAGE;
+    constexpr int SMEM_M_SLOT  = (META_STEPS == 1) ? 0 : BLOCK_WR_T * META_STEPS * 8;
+    constexpr int SMEM_M_OFF   = DB_STAGES * SMEM_PER_STAGE;
+    constexpr int SMEM_DB      = SMEM_M_OFF + 2 * SMEM_M_SLOT;
+    static_assert(SMEM_DB == sp_smem_bytes<BLOCK_WR_T, BLOCK_BC_T, DB_STAGES>(), "smem layout");
+    static_assert(META_STEPS == 1 || META_STEPS >= DB_STAGES - 1,
+                  "2-slot metadata ring needs META_STEPS >= DB_STAGES - 1");
     // Epilogue staging (reuses smem after K-loop)
     constexpr int SMEM_EPILOGUE = 8 * 16 * SP_STAGE_PAD * (int)sizeof(int32_t);
     constexpr int SMEM_BYTES = (SMEM_DB > SMEM_EPILOGUE) ? SMEM_DB : SMEM_EPILOGUE;
@@ -572,9 +594,25 @@ __device__ __forceinline__ void sparse_gemm_impl(
         b_src[it] = x_int8 + (size_t)min(block_bc + row, M - 1) * K + col;
         b_dst[it] = SMEM_A_STAGE + row * SP_BLOCK_K + b_swiz(row, col);
     }
-    const bool m_loader = (t < BLOCK_WR_T);
-    const uint32_t* m_src = w_meta + (size_t)min(block_wr + (m_loader ? t : 0), N_out - 1) * meta_cols;
-    const uint32_t  m_dst = SMEM_A_STAGE + SMEM_B_STAGE + t * 8;
+    // Metadata chunk: a row's META_STEPS x 8 bytes are copied by META_STEPS consecutive
+    // threads (one K step each), so each row is one coalesced request. Within the row the
+    // 8-byte step slot is XOR-swizzled by (row >> 2) & 3 so compute-side reads (16 rows x
+    // 2 words per warp) are bank-conflict-free.
+    constexpr int M_COPIES = (BLOCK_WR_T * META_STEPS + SP_THREADS - 1) / SP_THREADS;
+    static_assert(META_STEPS == 1 || BLOCK_WR_T * META_STEPS % SP_THREADS == 0,
+                  "metadata copies must divide evenly");
+    const bool m_loader = (t < BLOCK_WR_T * META_STEPS);
+    const int  m_j = t % META_STEPS;                      // K step within the chunk
+    const uint32_t* m_src[M_COPIES];
+    uint32_t        m_dst[M_COPIES];
+    #pragma unroll
+    for (int it = 0; it < M_COPIES; it++) {
+        const int row = t / META_STEPS + it * (SP_THREADS / META_STEPS);
+        m_src[it] = w_meta + (size_t)min(block_wr + row, N_out - 1) * meta_cols + 2 * m_j;
+        m_dst[it] = (META_STEPS == 1)
+            ? (uint32_t)(SMEM_A_STAGE + SMEM_B_STAGE + row * 8)            // stage-relative
+            : (uint32_t)(row * (META_STEPS * 8) + ((m_j ^ ((row >> 2) & 3)) << 3));
+    }
 
     // Async load of absolute K step K_ABS into the stage at smem byte offset STAGE_OFF.
     #define LOAD_TILE(STAGE_OFF, K_ABS) do {                                      \
@@ -585,8 +623,19 @@ __device__ __forceinline__ void sparse_gemm_impl(
         _Pragma("unroll")                                                          \
         for (int _it = 0; _it < B_ITERS; _it++)                                   \
             cp_async_16_stream_u32(_so + b_dst[_it], b_src[_it] + (K_ABS) * SP_BLOCK_K); \
-        if (m_loader)                                                              \
-            cp_async_8_u32(_so + m_dst, m_src + (K_ABS) * 2);                     \
+        if constexpr (META_STEPS == 1) {                                           \
+            if (m_loader)                                                          \
+                cp_async_8_u32(_so + m_dst[0], m_src[0] + (K_ABS) * 2);            \
+        } else if (((K_ABS) % META_STEPS) == 0 || (K_ABS) == k_start_iter) {       \
+            /* metadata chunk: at chunk boundaries and at the tile's first K step */\
+            const int _c = (K_ABS) / META_STEPS;                                   \
+            if (_c * META_STEPS + m_j < K_iters_total) {                           \
+                const uint32_t _ms = smem_base + SMEM_M_OFF + (_c & 1) * SMEM_M_SLOT;\
+                _Pragma("unroll")                                                  \
+                for (int _it = 0; _it < M_COPIES; _it++)                           \
+                    cp_async_8_u32(_ms + m_dst[_it], m_src[_it] + _c * (META_STEPS * 2));\
+            }                                                                      \
+        }                                                                          \
         cp_async_commit();                                                         \
     } while (0)
 
@@ -603,7 +652,8 @@ __device__ __forceinline__ void sparse_gemm_impl(
     //   M-tile keeps the swizzle phase, so M-tile mi is +mi*16*SP_K_COMP.
     // B (x4): lane L addresses row warp_bc + (L & 7), 16-byte K chunk (L >> 3); +8 rows per
     //   N-tile keeps the swizzle phase (+nj*8*SP_BLOCK_K).
-    // Metadata: lane (g, tid) reads row warp_wr + g + 8*(tid&1), word tid>>1.
+    // Metadata: lane (g, tid) reads row warp_wr + mi*16 + g + 8*(tid&1), word tid>>1 of the
+    //   current step's (swizzled) 8-byte slot; the swizzle phase q is the same for every mi.
     const uint32_t a_ldm_off = [&] {
         const int row = warp_wr + (lane & 15);
         return (uint32_t)(row * SP_K_COMP + a_swiz(row, (lane >> 4) << 4));
@@ -612,8 +662,10 @@ __device__ __forceinline__ void sparse_gemm_impl(
         const int row = warp_bc + (lane & 7);
         return (uint32_t)(SMEM_A_STAGE + row * SP_BLOCK_K + b_swiz(row, (lane >> 3) << 4));
     }();
-    const uint32_t m_ldm_off = SMEM_A_STAGE + SMEM_B_STAGE
-        + (uint32_t)((warp_wr + groupID + ((tid & 1) << 3)) * 8 + (tid >> 1) * 4);
+    const int      m_row     = warp_wr + groupID + ((tid & 1) << 3);
+    const int      m_q       = (m_row >> 2) & 3;
+    const uint32_t m_ldm_off = (META_STEPS == 1 ? SMEM_A_STAGE + SMEM_B_STAGE : SMEM_M_OFF)
+                             + (uint32_t)(m_row * (META_STEPS * 8) + (tid >> 1) * 4);
 
     // ── Main K-loop (over local K range) ──
     //
@@ -647,13 +699,22 @@ __device__ __forceinline__ void sparse_gemm_impl(
 
         const uint32_t cur = smem_base + comp_off;
 
-        // ── Metadata from shared memory (staged by LOAD_TILE) ──
-        // The 32 lanes read 32 consecutive words: one conflict-free LDS per M-tile.
+        // ── Metadata from the shared-memory ring (staged by LOAD_TILE) ──
+        // One conflict-free LDS per M-tile.
+        uint32_t m_cur;
+        if constexpr (META_STEPS == 1) {
+            m_cur = cur + m_ldm_off;
+        } else {
+            const int k_abs = k_start_iter + ki;
+            m_cur = smem_base + m_ldm_off
+                  + ((k_abs / META_STEPS) & 1) * SMEM_M_SLOT
+                  + (((k_abs % META_STEPS) ^ m_q) << 3);
+        }
         uint32_t e_meta[TILES_M];
         #pragma unroll
         for (int mi = 0; mi < TILES_M; mi++)
             asm volatile("ld.shared.u32 %0, [%1];\n"
-                         : "=r"(e_meta[mi]) : "r"(cur + m_ldm_off + mi * 16 * 8));
+                         : "=r"(e_meta[mi]) : "r"(m_cur + mi * 16 * (META_STEPS * 8)));
 
         // ── Per-warp MMA computation ──
         // All TILES_M A fragments are loaded once per K step and held in registers; the
@@ -1213,7 +1274,7 @@ template <int BW, int BC>
 constexpr int sparse_gemm_smem_bytes() {
     constexpr int PER_STAGE = BW * SP_K_COMP + BC * SP_BLOCK_K;
     constexpr int STAGES = (PER_STAGE * 4 <= 48 * 1024) ? 4 : 3;
-    constexpr int SMEM_DB = STAGES * (PER_STAGE + BW * 2 * (int)sizeof(uint32_t));
+    constexpr int SMEM_DB = sp_smem_bytes<BW, BC, STAGES>();
     constexpr int SMEM_EPI = 8 * 16 * SP_STAGE_PAD * (int)sizeof(int32_t);
     return (SMEM_DB > SMEM_EPI) ? SMEM_DB : SMEM_EPI;
 }
@@ -1233,7 +1294,7 @@ constexpr int occ2_smem_bytes() {
     // Fewer stages to keep per-block smem ≤ 32KB (2 blocks × 32KB = 64KB config)
     constexpr int STAGES = (PER_STAGE * 4 <= 32 * 1024) ? 4
                          : (PER_STAGE * 3 <= 32 * 1024) ? 3 : 2;
-    constexpr int SMEM_DB = STAGES * (PER_STAGE + BW * 2 * (int)sizeof(uint32_t));
+    constexpr int SMEM_DB = sp_smem_bytes<BW, BC, STAGES>();
     constexpr int SMEM_EPI = 8 * 16 * SP_STAGE_PAD * (int)sizeof(int32_t);
     return (SMEM_DB > SMEM_EPI) ? SMEM_DB : SMEM_EPI;
 }
