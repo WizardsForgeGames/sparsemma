@@ -1367,36 +1367,14 @@ std::vector<torch::Tensor> sparse_prune_and_pack(torch::Tensor weight_int8) {
     return {compressed, meta_packed};
 }
 
-torch::Tensor sparse_int8_linear(
-    torch::Tensor x,           // (M, K) fp16 activation
-    torch::Tensor w_comp,      // (N_out, K/2) int8 compressed weight
-    torch::Tensor w_meta,      // (N_out, K/32) int32 packed metadata
-    torch::Tensor w_scale,     // (N_out,) fp16 weight scale
-    torch::Tensor bias         // (N_out,) fp16 or empty tensor
-) {
-    /*
-     * Full sparse INT8 linear: quantize activation → sparse GEMM → dequant + bias.
-     * Returns output (M, N_out) fp16.
-     */
+// Quantize activation (M, K) fp16 -> int8 (M, K) + per-token fp32 scales (M,).
+std::vector<torch::Tensor> sparse_quantize_act(torch::Tensor x) {
     TORCH_CHECK(x.is_cuda() && x.dtype() == torch::kFloat16, "x must be fp16 CUDA");
     TORCH_CHECK(x.dim() == 2, "x must be 2D (M, K)");
     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
-    TORCH_CHECK(w_comp.is_cuda() && w_comp.dtype() == torch::kInt8, "w_comp must be int8 CUDA");
-    TORCH_CHECK(w_comp.is_contiguous(), "w_comp must be contiguous");
-    TORCH_CHECK(w_meta.is_cuda() && w_meta.dtype() == torch::kInt32, "w_meta must be int32 CUDA");
-    TORCH_CHECK(w_meta.is_contiguous(), "w_meta must be contiguous");
-
-    const int M     = x.size(0);
-    const int K     = x.size(1);
-    const int N_out = w_comp.size(0);
-    TORCH_CHECK(w_comp.size(1) == K / 2, "w_comp cols must be K/2");
-    TORCH_CHECK(w_meta.size(0) == N_out && w_meta.size(1) == K / 32,
-                "w_meta shape must be (N_out, K/32)");
-    TORCH_CHECK(K % 64 == 0, "K must be multiple of 64 (BLOCK_K=64), got ", K);
-    TORCH_CHECK(N_out % 16 == 0, "N_out must be multiple of 16, got ", N_out);
-
+    const int M = x.size(0);
+    const int K = x.size(1);
     auto stream = at::cuda::getCurrentCUDAStream();
-
     // Step 1: Quantize activation (M, K) fp16 → int8 + scales
     auto x_int8    = torch::empty({M, K}, torch::dtype(torch::kInt8).device(x.device()));
     auto act_scale = torch::empty({M},    torch::dtype(torch::kFloat32).device(x.device()));
@@ -1409,6 +1387,43 @@ torch::Tensor sparse_int8_linear(
             K
         );
     }
+
+    return {x_int8, act_scale};
+}
+
+// Sparse GEMM + dequant + bias on pre-quantized activations.
+//   force_tile: -1 = heuristic, 0 = 256x128, 1 = 128x128, 2 = 128x64
+//   force_split: -1 = heuristic, >= 1 = that split-K factor
+torch::Tensor sparse_int8_gemm(
+    torch::Tensor x_int8,      // (M, K) int8 activation
+    torch::Tensor act_scale,   // (M,) fp32 per-token scale
+    torch::Tensor w_comp,      // (N_out, K/2) int8 compressed weight
+    torch::Tensor w_meta,      // (N_out, K/32) int32 packed metadata
+    torch::Tensor w_scale,     // (N_out,) fp16 weight scale
+    torch::Tensor bias,        // (N_out,) fp16 or empty tensor
+    int64_t force_tile,
+    int64_t force_split
+) {
+    TORCH_CHECK(x_int8.is_cuda() && x_int8.dtype() == torch::kInt8, "x_int8 must be int8 CUDA");
+    TORCH_CHECK(x_int8.dim() == 2 && x_int8.is_contiguous(), "x_int8 must be 2D contiguous");
+    TORCH_CHECK(act_scale.is_cuda() && act_scale.dtype() == torch::kFloat32, "act_scale must be fp32 CUDA");
+    TORCH_CHECK(w_comp.is_cuda() && w_comp.dtype() == torch::kInt8, "w_comp must be int8 CUDA");
+    TORCH_CHECK(w_comp.is_contiguous(), "w_comp must be contiguous");
+    TORCH_CHECK(w_meta.is_cuda() && w_meta.dtype() == torch::kInt32, "w_meta must be int32 CUDA");
+    TORCH_CHECK(w_meta.is_contiguous(), "w_meta must be contiguous");
+
+    const int M     = x_int8.size(0);
+    const int K     = x_int8.size(1);
+    const int N_out = w_comp.size(0);
+    TORCH_CHECK(act_scale.numel() == M, "act_scale must have M elements");
+    TORCH_CHECK(w_comp.size(1) == K / 2, "w_comp cols must be K/2");
+    TORCH_CHECK(w_meta.size(0) == N_out && w_meta.size(1) == K / 32,
+                "w_meta shape must be (N_out, K/32)");
+    TORCH_CHECK(K % 64 == 0, "K must be multiple of 64 (BLOCK_K=64), got ", K);
+    TORCH_CHECK(N_out % 16 == 0, "N_out must be multiple of 16, got ", N_out);
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const auto& x = x_int8;  // device / options source for allocations below
 
     // Step 2: Sparse GEMM + dequant + bias → output (M, N_out) fp16
     auto output = torch::empty({M, N_out},
@@ -1435,7 +1450,13 @@ torch::Tensor sparse_int8_linear(
 
     // Determine tile shape
     int BW, BC;
-    if (M > SP_WIDE_M_THRESHOLD && N_out >= SP_TALL_N_THRESHOLD) {
+    if (force_tile == 0) {
+        BW = 256; BC = 128;
+    } else if (force_tile == 1) {
+        BW = 128; BC = 128;
+    } else if (force_tile == 2) {
+        BW = 128; BC = 64;
+    } else if (M > SP_WIDE_M_THRESHOLD && N_out >= SP_TALL_N_THRESHOLD) {
         BW = 256; BC = 128;
     } else if (M > SP_WIDE_M_THRESHOLD) {
         BW = 128; BC = 128;
@@ -1463,6 +1484,7 @@ torch::Tensor sparse_int8_linear(
         if (split_k > SP_MAX_SPLIT_K) split_k = SP_MAX_SPLIT_K;
         if (split_k < 1) split_k = 1;
     }
+    if (force_split >= 1) split_k = (int)force_split;
 
     const int k_iters_per_split = (k_iters_total + split_k - 1) / split_k;
 
@@ -1569,6 +1591,25 @@ torch::Tensor sparse_int8_linear(
     return output;
 }
 
+torch::Tensor sparse_int8_linear(
+    torch::Tensor x,           // (M, K) fp16 activation
+    torch::Tensor w_comp,      // (N_out, K/2) int8 compressed weight
+    torch::Tensor w_meta,      // (N_out, K/32) int32 packed metadata
+    torch::Tensor w_scale,     // (N_out,) fp16 weight scale
+    torch::Tensor bias         // (N_out,) fp16 or empty tensor
+) {
+    /*
+     * Full sparse INT8 linear: quantize activation -> sparse GEMM -> dequant + bias.
+     * Returns output (M, N_out) fp16.
+     */
+    TORCH_CHECK(x.is_cuda() && x.dtype() == torch::kFloat16, "x must be fp16 CUDA");
+    TORCH_CHECK(x.dim() == 2, "x must be 2D (M, K)");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.size(1) == 2 * w_comp.size(1), "x cols must be 2 * w_comp cols");
+    auto q = sparse_quantize_act(x);
+    return sparse_int8_gemm(q[0], q[1], w_comp, w_meta, w_scale, bias, -1, -1);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Python bindings
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1580,6 +1621,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Prune + compress + pack metadata: (N,K) int8 -> compressed + packed meta");
     m.def("sparse_int8_linear", &sparse_int8_linear,
           "Full sparse INT8 linear: quant -> sparse GEMM -> dequant+bias");
+    m.def("sparse_quantize_act", &sparse_quantize_act,
+          "Per-token activation quantize: (M,K) fp16 -> int8 (M,K) + fp32 scales (M,)");
+    m.def("sparse_int8_gemm", &sparse_int8_gemm,
+          "Sparse GEMM + dequant + bias on pre-quantized activations",
+          py::arg("x_int8"), py::arg("act_scale"), py::arg("w_comp"), py::arg("w_meta"),
+          py::arg("w_scale"), py::arg("bias"), py::arg("force_tile") = -1,
+          py::arg("force_split") = -1);
     m.def("test_mma_sp", &test_mma_sp,
           "Minimal mma.sp test: one 16x8 tile via m16n8k32 sparse INT8");
 }
