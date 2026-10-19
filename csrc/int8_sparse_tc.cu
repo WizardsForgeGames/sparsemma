@@ -721,58 +721,80 @@ __device__ __forceinline__ void sparse_gemm_impl(
         ahead_off = (ahead_off + SMEM_PER_STAGE == DB_STAGES * SMEM_PER_STAGE) ? 0 : ahead_off + SMEM_PER_STAGE;
     }
 
-    // Final sync: ensures all warps finished the last K-iteration's compute
-    // before the epilogue reuses smem_raw for accumulator staging.
-    __syncthreads();
-
     // ════════════════════════════════════════════════════════════════
-    //  Epilogue: dequant + bias + transposed write via smem staging
+    //  Epilogue: dequant + bias in registers, transposed store
     //
-    //  MMA output is C(N_out, M). We write output(M, N_out) transposed.
-    //  Stage each 16×8 tile through smem with padded stride (9) to
-    //  avoid bank conflicts during the column-wise readback.
+    //  MMA output is C(N_out, M) in fragment layout: acc[mi][nj] holds
+    //  (wr = m0+g, bc = n0+2tid / n0+2tid+1) and (wr = m0+g+8, same bc).
+    //  Output is (M, N_out) row-major, so consecutive wr must be adjacent.
+    //  Each 8x8 block is packed to half2 (row wr, cols bc, bc+1) and transposed
+    //  in registers with movmatrix: afterwards the lane holds (row bc = n0+g,
+    //  cols wr = m0+2tid, m0+2tid+1) -> one aligned 4-byte store per block.
+    //  No shared memory, so no extra CTA barrier before the next tile.
     // ════════════════════════════════════════════════════════════════
-    int32_t (*smem_stage)[16][SP_STAGE_PAD] =
-        reinterpret_cast<int32_t (*)[16][SP_STAGE_PAD]>(smem_raw);
+    {
+        float ws_r[TILES_M][2], bias_r[TILES_M][2];
+        #pragma unroll
+        for (int mi = 0; mi < TILES_M; mi++) {
+            #pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const int wr = min(block_wr + warp_wr + mi * 16 + groupID + h * 8, N_out - 1);
+                ws_r[mi][h]   = __half2float(w_scale[wr]);
+                bias_r[mi][h] = (bias != nullptr && splitk_ws == nullptr)
+                              ? __half2float(bias[wr]) : 0.0f;
+            }
+        }
 
-    #pragma unroll
-    for (int mi = 0; mi < TILES_M; mi++) {
         #pragma unroll
         for (int nj = 0; nj < TILES_N; nj++) {
-            smem_stage[warp][groupID    ][tid * 2]     = acc[mi][nj][0];
-            smem_stage[warp][groupID    ][tid * 2 + 1] = acc[mi][nj][1];
-            smem_stage[warp][groupID + 8][tid * 2]     = acc[mi][nj][2];
-            smem_stage[warp][groupID + 8][tid * 2 + 1] = acc[mi][nj][3];
-            __syncwarp();
+            const int bc_frag = block_bc + warp_bc + nj * 8 + tid * 2;   // fragment columns
+            const float as0 = act_scale[min(bc_frag,     M - 1)];
+            const float as1 = act_scale[min(bc_frag + 1, M - 1)];
 
-            const int tile_wr = block_wr + warp_wr + mi * 16;
-            const int tile_bc = block_bc + warp_bc + nj * 8;
-
-            #pragma unroll
-            for (int i = lane; i < 128; i += 32) {
-                const int bc_local = i / 16;
-                const int wr_local = i % 16;
-                const int wr = tile_wr + wr_local;
-                const int bc = tile_bc + bc_local;
-
-                if (wr < N_out && bc < M) {
-                    float val = static_cast<float>(smem_stage[warp][wr_local][bc_local]);
-                    val *= act_scale[bc] * __half2float(w_scale[wr]);
-                    if (splitk_ws != nullptr) {
-                        // Split-K: atomicAdd fp32 partial (bias added in reduce kernel)
-                        atomicAdd(&splitk_ws[(size_t)bc * N_out + wr], val);
-                    } else {
-                        if (bias != nullptr)
-                            val += __half2float(bias[wr]);
-                        output[(size_t)bc * N_out + wr] = __float2half(val);
+            if (splitk_ws != nullptr) {
+                // Split-K: fp32 partials accumulated with atomics (bias in reduce kernel)
+                #pragma unroll
+                for (int mi = 0; mi < TILES_M; mi++) {
+                    #pragma unroll
+                    for (int h = 0; h < 2; h++) {
+                        const int wr = block_wr + warp_wr + mi * 16 + groupID + h * 8;
+                        if (wr < N_out) {
+                            if (bc_frag < M)
+                                atomicAdd(&splitk_ws[(size_t)bc_frag * N_out + wr],
+                                          (float)acc[mi][nj][2 * h] * (as0 * ws_r[mi][h]));
+                            if (bc_frag + 1 < M)
+                                atomicAdd(&splitk_ws[(size_t)(bc_frag + 1) * N_out + wr],
+                                          (float)acc[mi][nj][2 * h + 1] * (as1 * ws_r[mi][h]));
+                        }
+                    }
+                }
+            } else {
+                const int bc_out = block_bc + warp_bc + nj * 8 + groupID;    // after transpose
+                #pragma unroll
+                for (int mi = 0; mi < TILES_M; mi++) {
+                    const int wr_base = block_wr + warp_wr + mi * 16;        // 16-row group
+                    #pragma unroll
+                    for (int h = 0; h < 2; h++) {
+                        float v0 = (float)acc[mi][nj][2 * h]     * (as0 * ws_r[mi][h]) + bias_r[mi][h];
+                        float v1 = (float)acc[mi][nj][2 * h + 1] * (as1 * ws_r[mi][h]) + bias_r[mi][h];
+                        __half2 hv = __floats2half2_rn(v0, v1);
+                        uint32_t packed = *reinterpret_cast<uint32_t*>(&hv);
+                        uint32_t trans;
+                        asm volatile("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;\n"
+                                     : "=r"(trans) : "r"(packed));
+                        // N_out % 16 == 0: a 16-row group is entirely in or out of range
+                        if (wr_base < N_out && bc_out < M)
+                            *reinterpret_cast<uint32_t*>(
+                                output + (size_t)bc_out * N_out + wr_base + h * 8 + tid * 2) = trans;
                     }
                 }
             }
-            __syncwarp();
         }
     }
 
-    __syncthreads();  // ensure epilogue writes complete before next tile
+    // Next tile's prologue overwrites pipeline stages other warps may still be
+    // reading in their last K step: one barrier per tile.
+    __syncthreads();
     } // end persistent tile loop
 
     #undef LOAD_TILE
@@ -1470,15 +1492,27 @@ torch::Tensor sparse_int8_gemm(
         splitk_ws_ptr = splitk_ws.data_ptr<float>();
     }
 
-    #define LAUNCH_SPARSE_GEMM(BWv, BCv) do {                                       \
-        constexpr int _smem = sparse_gemm_smem_bytes<(BWv), (BCv)>();              \
-        if (_smem > 48 * 1024) {                                                   \
-            cudaFuncSetAttribute(sparse_gemm_kernel<(BWv), (BCv)>,                 \
-                cudaFuncAttributeMaxDynamicSharedMemorySize, _smem);                \
+    #define LAUNCH_SPARSE_GEMM(BWv, BCv) do {                                      \
+        /* One persistent CTA per SM. When registers and smem would allow two, the */\
+        /* block scheduler can place two of the #SMs CTAs on one SM and leave     */\
+        /* another idle (measured: 128x64 at 96 regs ran 12-19% slower), and two  */\
+        /* co-resident CTAs were slower even with a 2x grid. Requesting just over */\
+        /* half the SM's shared memory guarantees one CTA per SM on any GPU.      */\
+        constexpr int _smem_k = sparse_gemm_smem_bytes<(BWv), (BCv)>();            \
+        static int _smem = 0;                                                      \
+        if (_smem == 0) {                                                          \
+            const auto* _p = at::cuda::getCurrentDeviceProperties();               \
+            const int _half = (int)_p->sharedMemPerMultiprocessor / 2              \
+                            - (int)_p->reservedSharedMemPerBlock + 128;            \
+            _smem = (_smem_k > _half) ? _smem_k : _half;                           \
+            if (_smem > (int)_p->sharedMemPerBlockOptin) _smem = _smem_k;          \
+            if (_smem > 48 * 1024)                                                 \
+                cudaFuncSetAttribute(sparse_gemm_kernel<(BWv), (BCv)>,             \
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, _smem);           \
         }                                                                          \
         const int _total = spatial_tiles * split_k;                                \
-        const int _nctas = (_total < SP_MAX_CTAS) ? _total : SP_MAX_CTAS;        \
-        sparse_gemm_kernel<(BWv), (BCv)><<<_nctas, SP_THREADS, _smem, stream>>>(  \
+        const int _nctas = (_total < SP_MAX_CTAS) ? _total : SP_MAX_CTAS;          \
+        sparse_gemm_kernel<(BWv), (BCv)><<<_nctas, SP_THREADS, _smem, stream>>>(   \
             w_comp.data_ptr<int8_t>(),                                             \
             x_int8.data_ptr<int8_t>(),                                             \
             reinterpret_cast<const uint32_t*>(w_meta.data_ptr<int32_t>()),         \
