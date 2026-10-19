@@ -388,11 +388,6 @@ constexpr int SP_WARPS_BC = 2;
 constexpr int SP_THREADS  = SP_WARPS_WR * SP_WARPS_BC * 32;  // 256
 constexpr int SP_STAGE_PAD = 9;     // epilogue staging pad for bank conflicts
 
-// M threshold for wide tile variant (benchmarked on RTX 4090)
-constexpr int SP_WIDE_M_THRESHOLD = 2048;
-// N_out threshold for tall tile variant: need enough N-tiles (≥8) to fill the GPU.
-// At BLOCK_WR=256, need N_out >= 8*256=2048 for good occupancy on 128 SMs.
-constexpr int SP_TALL_N_THRESHOLD = 2048;
 
 // Sparsity metadata staging (2 uint32 per weight row per 64-deep K step):
 //   META_STEPS = 1: 8 bytes per row in every pipeline stage. 8 useful bytes per 32-byte
@@ -1506,58 +1501,49 @@ torch::Tensor sparse_int8_gemm(
         ? reinterpret_cast<const __half*>(bias.data_ptr<at::Half>())
         : nullptr;
 
-    // Dispatch: select tile shape based on problem dimensions.
-    //   - Tall (256×128): large M + large N_out → highest arithmetic intensity
-    //   - Wide (128×128): large M → good throughput
-    //   - Narrow (128×64): small M → fewer wasted threads
-    // Persistent kernel: 1D grid with min(128, total_work_items) CTAs.
-    // Block-partitioned tile assignment keeps weight tiles hot in L2.
-    //
-    // Split-K: when spatial tiles are too few to fill all SMs, split the K
-    // dimension across multiple CTAs. Each CTA computes a partial result
-    // and atomicAdds it into an fp32 workspace. A reduce kernel finalizes.
-    // One persistent CTA per SM, queried from the device (128 on an RTX 4090).
+    // Dispatch: pick (tile, split-K) by a wave-aware cost model fitted on an RTX 4090
+    // sweep (K 1280..6144 x N 768..6144 x M 64..8192, every tile x split):
+    //   t(tile, s) = waves * (a_tile * ceil(ksteps / s) + b_tile)
+    //              + [s > 1] * (c0 + (c1 + c2 * s) * M*N/1e6)
+    //   waves      = ceil(spatial_tiles(tile) * s / SMs)   (one persistent CTA per SM)
+    // a_tile: time per 64-deep K step of one tile, b_tile: per-tile fixed cost (pipeline
+    // fill, epilogue), c0/c1/c2: split-K launch, workspace memset + reduce, atomics.
+    // Splits above 6 lost on every measured shape (atomic contention on the M x N
+    // partials outgrows the extra parallelism), so they are not candidates.
+    // Wave quantization dominates small and mid shapes, which fixed M/N thresholds miss.
     const int SP_MAX_CTAS = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-    constexpr int SP_SPLITK_TILE_THRESHOLD = 64;  // use split-K below this
-    constexpr int SP_MAX_SPLIT_K = 32;
-
-    // Determine tile shape
-    int BW, BC;
-    if (force_tile == 0) {
-        BW = 256; BC = 128;
-    } else if (force_tile == 1) {
-        BW = 128; BC = 128;
-    } else if (force_tile == 2) {
-        BW = 128; BC = 64;
-    } else if (M > SP_WIDE_M_THRESHOLD && N_out >= SP_TALL_N_THRESHOLD) {
-        BW = 256; BC = 128;
-    } else if (M > SP_WIDE_M_THRESHOLD) {
-        BW = 128; BC = 128;
-    } else {
-        BW = 128; BC = 64;
-    }
-
-    const int spatial_tiles = ((N_out + BW - 1) / BW) * ((M + BC - 1) / BC);
     const int k_iters_total = K / SP_BLOCK_K;
+    static const int    kTileBW[3] = {256, 128, 128};
+    static const int    kTileBC[3] = {128, 128, 64};
+    static const double kA[3] = {8.1730e-04, 4.0900e-04, 3.1130e-04};   // ms per K step per tile
+    static const double kB[3] = {3.5480e-03, 2.2260e-03, 1.2530e-03};   // ms per tile
+    constexpr double kSplitC0 = 2.9200e-03;                      // ms per split-K launch
+    constexpr double kSplitC1 = 1.1810e-03;                      // ms per 1e6 outputs
+    constexpr double kSplitC2 = 2.4990e-03;                      // ms per 1e6 outputs per split
+    static const int    kSplits[] = {1, 2, 3, 4, 6};
 
-    // Compute split-K factor.
-    // Split-K trades workspace allocation + atomicAdd + reduce kernel overhead
-    // for better SM utilization when spatial tiles are too few. Only worthwhile
-    // when K is large enough (≥8 iters) to give each split meaningful work,
-    // and the problem is large enough that workspace overhead is amortized.
-    constexpr int SP_MIN_K_PER_SPLIT = 4;  // each split needs ≥4 iters for pipeline
-    int split_k = 1;
-    if (spatial_tiles < SP_SPLITK_TILE_THRESHOLD && k_iters_total >= 8) {
-        // Round down so spatial_tiles * split_k stays within one wave of CTAs
-        // (rounding up could launch a second, mostly idle wave).
-        split_k = SP_MAX_CTAS / spatial_tiles;
-        // Ensure each split gets enough K-iterations for the pipeline
-        const int max_by_k = k_iters_total / SP_MIN_K_PER_SPLIT;
-        if (split_k > max_by_k) split_k = max_by_k;
-        if (split_k > SP_MAX_SPLIT_K) split_k = SP_MAX_SPLIT_K;
-        if (split_k < 1) split_k = 1;
+    int tile = -1, split_k = 1;
+    double best_cost = 1e30;
+    for (int t = 0; t < 3; t++) {
+        if (force_tile >= 0 && t != force_tile) continue;
+        const long long tiles = (long long)((N_out + kTileBW[t] - 1) / kTileBW[t])
+                              * ((M + kTileBC[t] - 1) / kTileBC[t]);
+        for (int s : kSplits) {
+            if (force_split >= 1 && s != force_split) continue;
+            if (force_split < 1 && s > 1 && s > k_iters_total / 2) continue;
+            const long long waves = (tiles * s + SP_MAX_CTAS - 1) / SP_MAX_CTAS;
+            const int ksteps = (k_iters_total + s - 1) / s;
+            double cost = (double)waves * (kA[t] * ksteps + kB[t]);
+            if (s > 1) cost += kSplitC0 + (kSplitC1 + kSplitC2 * s) * ((double)M * N_out * 1e-6);
+            if (cost < best_cost) { best_cost = cost; tile = t; split_k = s; }
+        }
     }
-    if (force_split >= 1) split_k = (int)force_split;
+    if (force_split >= 1 && tile < 0) {   // forced split outside the candidate list
+        tile = (force_tile >= 0) ? (int)force_tile : 1;
+        split_k = (int)force_split;
+    }
+    const int BW = kTileBW[tile], BC = kTileBC[tile];
+    const int spatial_tiles = ((N_out + BW - 1) / BW) * ((M + BC - 1) / BC);
 
     const int k_iters_per_split = (k_iters_total + split_k - 1) / split_k;
 
