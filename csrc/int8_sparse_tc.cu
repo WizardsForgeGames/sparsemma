@@ -791,14 +791,13 @@ __device__ __forceinline__ void sparse_gemm_impl(
             }
         }
 
-        #pragma unroll
-        for (int nj = 0; nj < TILES_N; nj++) {
-            const int bc_frag = block_bc + warp_bc + nj * 8 + tid * 2;   // fragment columns
-            const float as0 = act_scale[min(bc_frag,     M - 1)];
-            const float as1 = act_scale[min(bc_frag + 1, M - 1)];
-
-            if (splitk_ws != nullptr) {
-                // Split-K: fp32 partials accumulated with atomics (bias in reduce kernel)
+        if (splitk_ws != nullptr) {
+            // Split-K: fp32 partials accumulated with atomics (bias in reduce kernel)
+            #pragma unroll
+            for (int nj = 0; nj < TILES_N; nj++) {
+                const int bc_frag = block_bc + warp_bc + nj * 8 + tid * 2;   // fragment columns
+                const float as0 = act_scale[min(bc_frag,     M - 1)];
+                const float as1 = act_scale[min(bc_frag + 1, M - 1)];
                 #pragma unroll
                 for (int mi = 0; mi < TILES_M; mi++) {
                     #pragma unroll
@@ -814,11 +813,31 @@ __device__ __forceinline__ void sparse_gemm_impl(
                         }
                     }
                 }
-            } else {
-                const int bc_out = block_bc + warp_bc + nj * 8 + groupID;    // after transpose
+            }
+        } else {
+            // Stage the warp's WARP_BC x WARP_WR fp16 tile in shared memory as output rows
+            // (bc-major), then write 16-byte vectors: a warp store covers whole 64/128-byte
+            // row segments instead of 8 rows x 16 bytes. The pipeline buffers are free once
+            // every warp has finished its last K step (barrier below).
+            constexpr int ROW_B = WARP_WR * 2;              // staged row pitch (bytes)
+            constexpr int CPR   = WARP_WR / 8;              // 16-byte chunks per row (8 or 4)
+            static_assert(CPR == 8 || CPR == 4, "staging swizzle assumes 4 or 8 chunks per row");
+            static_assert(SP_WARPS_WR * SP_WARPS_BC * WARP_BC * ROW_B <= SMEM_DB,
+                          "epilogue staging must fit in the pipeline buffers");
+            // XOR swizzle of the 16-byte chunk: conflict-free for the 8-row fragment stores
+            // and for the 16-byte row reads.
+            auto swz = [](int r) { return (CPR == 8) ? (r & 7) : ((r >> 1) & 3); };
+            const uint32_t stg = smem_base + (uint32_t)(warp * WARP_BC * ROW_B);
+            __syncthreads();
+
+            #pragma unroll
+            for (int nj = 0; nj < TILES_N; nj++) {
+                const int bc_frag = block_bc + warp_bc + nj * 8 + tid * 2;   // fragment columns
+                const float as0 = act_scale[min(bc_frag,     M - 1)];
+                const float as1 = act_scale[min(bc_frag + 1, M - 1)];
+                const int r = nj * 8 + groupID;                              // row after transpose
                 #pragma unroll
                 for (int mi = 0; mi < TILES_M; mi++) {
-                    const int wr_base = block_wr + warp_wr + mi * 16;        // 16-row group
                     #pragma unroll
                     for (int h = 0; h < 2; h++) {
                         float v0 = (float)acc[mi][nj][2 * h]     * (as0 * ws_r[mi][h]) + bias_r[mi][h];
@@ -828,18 +847,33 @@ __device__ __forceinline__ void sparse_gemm_impl(
                         uint32_t trans;
                         asm volatile("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;\n"
                                      : "=r"(trans) : "r"(packed));
-                        // N_out % 16 == 0: a 16-row group is entirely in or out of range
-                        if (wr_base < N_out && bc_out < M)
-                            *reinterpret_cast<uint32_t*>(
-                                output + (size_t)bc_out * N_out + wr_base + h * 8 + tid * 2) = trans;
+                        const int c = mi * 2 + h;                            // 16-byte chunk
+                        asm volatile("st.shared.u32 [%0], %1;\n" ::
+                            "r"(stg + r * ROW_B + ((c ^ swz(r)) << 4) + tid * 4), "r"(trans));
                     }
                 }
+            }
+            __syncwarp();
+
+            #pragma unroll
+            for (int i = lane; i < WARP_BC * CPR; i += 32) {
+                const int r = i / CPR, c = i % CPR;
+                uint32_t v0, v1, v2, v3;
+                asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];\n"
+                             : "=r"(v0), "=r"(v1), "=r"(v2), "=r"(v3)
+                             : "r"(stg + r * ROW_B + ((c ^ swz(r)) << 4)));
+                const int bc = block_bc + warp_bc + r;
+                const int wr = block_wr + warp_wr + c * 8;
+                // N_out % 16 == 0, so an 8-column chunk is entirely in or out of range
+                if (bc < M && wr < N_out)
+                    *reinterpret_cast<uint4*>(output + (size_t)bc * N_out + wr) =
+                        make_uint4(v0, v1, v2, v3);
             }
         }
     }
 
-    // Next tile's prologue overwrites pipeline stages other warps may still be
-    // reading in their last K step: one barrier per tile.
+    // Next tile's prologue overwrites pipeline stages (and the epilogue staging) that
+    // other warps may still be reading.
     __syncthreads();
     } // end persistent tile loop
 
