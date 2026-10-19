@@ -5,13 +5,17 @@ Three compute backends (auto-selected per layer):
   1. "sparse" — 2:4 Sparse INT8 Tensor Core GEMM via PTX mma.sp.
      Prunes 50% of weights (2:4 pattern), compresses, and uses Sparse
      Tensor Cores for 2x throughput. Requires K % 64 == 0, N % 16 == 0.
-     75% weight VRAM savings vs FP16 (50% quantization + 50% compression).
+     ~69% weight VRAM savings vs FP16: 0.5 B/weight of int8 values + 0.125 B/weight
+     of 2:4 metadata (theoretical 75% before metadata and scales).
 
   2. "tc" — Custom INT8 Tensor Core GEMM via wmma intrinsics. Fuses
      GEMM + dequant + bias in one kernel. Requires K % 64 == 0, N % 16 == 0.
 
   3. "dequant" — Dequantize int8 weights to fp16 on-the-fly, then fp16
-     matmul. ~Same speed as nn.Linear but ~50% weight VRAM savings.
+     matmul. Fallback for "tc" layers (M < 768 or unaligned shapes).
+
+  Note: dense layers ("tc"/"dequant") keep both an (N, K) and a (K, N) int8 copy
+  of the weight, so their weight memory is about the same as FP16.
 
 Usage:
     from python.quantize_utils import quantize_model_sparse, quantize_model_tensorcore
@@ -260,7 +264,6 @@ def quantize_model_tensorcore(model, min_features=128, verbose=True):
     _replace_linear_tensorcore(model, min_features, stats)
 
     if verbose:
-        saved_mb = stats["quantized_params"] * 1 / 1e6
         tc_ok = tc_available()
         mode = "TC GEMM (custom INT8 Tensor Core)" if tc_ok else "dequant fallback"
         print(f"  Quantized {stats['num_replaced']} Linear layers -> Int8Linear [{mode}]")
@@ -268,7 +271,7 @@ def quantize_model_tensorcore(model, min_features=128, verbose=True):
         print(f"  Linear params: {stats['total_params'] / 1e6:.1f}M total, "
               f"{stats['quantized_params'] / 1e6:.1f}M quantized, "
               f"{stats['skipped_params'] / 1e6:.1f}M skipped")
-        print(f"  Estimated VRAM saved: ~{saved_mb:.0f} MB")
+        print("  Weight VRAM: ~same as FP16 (int8 weights stored in both (N,K) and (K,N) layouts)")
 
     return stats
 
@@ -305,7 +308,8 @@ def quantize_model_sparse(model, min_features=128, sparse_min_k=640, verbose=Tru
 
     if verbose:
         fp16_mb = stats["quantized_params"] * 2 / 1e6
-        sparse_mb = stats["quantized_params"] * 0.5625 / 1e6
+        # 0.5 B/weight int8 values (K/2 per row) + 0.125 B/weight metadata (K/32 int32 per row)
+        sparse_mb = stats["quantized_params"] * 0.625 / 1e6
         saved_mb = fp16_mb - sparse_mb
         print(f"  Quantized {stats['num_replaced']} Linear layers -> sparse Int8Linear")
         print(f"  Sparse-eligible: {stats['sparse_eligible']} layers")
