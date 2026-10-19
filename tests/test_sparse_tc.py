@@ -497,6 +497,39 @@ def test_tiled_gemm_correctness(mod):
     assert mean_rel < 0.03, f"mean rel error {mean_rel:.6f}"
 
 
+@pytest.mark.parametrize("K,N_out,M", [
+    (1280, 320, 70000),   # narrow N, activation larger than L2: auto picks the fused path
+    (1024, 336, 5000),    # ragged N (last weight tile partly past N_out), ragged M
+    (640, 1296, 2049),
+    (64, 16, 5),          # single K step, single tile
+])
+def test_fused_quantize_path_matches(mod, K, N_out, M):
+    """The fused quantize + GEMM path and the N-fastest tile order give bit-identical output
+    to quantize kernel + GEMM (int32 accumulation is exact; same per-element epilogue)."""
+    torch.manual_seed(K + N_out + M)
+    W = torch.randn(N_out, K, device="cuda") * 0.02
+    w_scale = W.abs().amax(1).clamp(min=1e-8) / 127.0
+    wq = (W / w_scale[:, None]).round().clamp(-128, 127).to(torch.int8)
+    wc, wm = mod.sparse_prune_and_pack(wq.contiguous())
+    x = torch.randn(M, K, device="cuda", dtype=torch.float16)
+    b = (torch.randn(N_out, device="cuda") * 0.1).half()
+    ws = w_scale.half()
+
+    ref = mod.sparse_int8_linear_ex(x, wc, wm, ws, b, 0)       # quantize kernel + GEMM
+    fused = mod.sparse_int8_linear_ex(x, wc, wm, ws, b, 1)     # fused path, forced
+    auto = mod.sparse_int8_linear(x, wc, wm, ws, b)
+    assert torch.equal(fused, ref)
+    assert torch.equal(auto, ref)
+    xq, xs = mod.sparse_quantize_act(x)
+    for tile in (0, 1, 2):
+        for order in (0, 1):
+            y = mod.sparse_int8_gemm(xq, xs, wc, wm, ws, b, tile, 1, order)
+            assert torch.equal(y, ref), (tile, order)
+    if (K, N_out, M) == (1280, 320, 70000):
+        assert mod.sparse_int8_linear_path(M, K, N_out) == 1
+    assert mod.sparse_int8_linear_path(4096, 1280, 5120) == 0   # headline shapes stay two-kernel
+
+
 def benchmark_sparse_vs_dense(mod):
     """Step 9: Benchmark sparse TC GEMM vs dense TC GEMM."""
     print()
