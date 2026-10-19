@@ -1,17 +1,33 @@
 """
-Test the hand-rolled sparse INT8 Tensor Core GEMM (PTX mma.sp).
+Correctness tests for the hand-rolled sparse INT8 Tensor Core GEMM (PTX mma.sp).
 
-Step 1: Compile the kernel
-Step 2: Verify the mma.sp instruction executes without crashing
-Step 3: Verify numerical correctness against a reference dense matmul
+Covers: compilation, 2:4 prune/compress, single-tile mma.sp exactness (uniform,
+varied and random data), the tiled GEMM against a reference matmul, UNet-scale
+shapes, and the Int8Linear / quantize_model_sparse integration.
+
+Usage:
+    python -m pytest tests/test_sparse_tc.py -v
+    python tests/test_sparse_tc.py           # same, via pytest.main
+    python tests/test_sparse_tc.py --bench   # sparse vs dense TC micro-benchmark
 """
 
-import torch
-import sys
 import os
+import sys
+
+import pytest
+import torch
 
 # Add project root to path (parent of tests/)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+@pytest.fixture(scope="module")
+def mod():
+    """Compile (or load from cache) the sparse TC extension once per test module."""
+    from csrc.build import load_sparse_tc
+    return load_sparse_tc()
 
 
 def pack_metadata_for_hardware(meta_raw, N, K):
@@ -82,19 +98,13 @@ def reference_sparse_matmul(A_dense, B_nk):
     return A @ B.T  # (16, 32) @ (32, 8) = (16, 8)
 
 
-def test_compile():
-    """Step 1: Just compile the module."""
-    print("=" * 60)
-    print("Step 1: Compiling int8_sparse_tc...")
-    print("=" * 60)
-    from csrc.build import load_sparse_tc
-    mod = load_sparse_tc()
+def test_compile(mod):
+    """Step 1: The module compiles and exports the expected functions."""
     funcs = [x for x in dir(mod) if not x.startswith('_')]
     print(f"  Exported functions: {funcs}")
-    assert 'test_mma_sp' in funcs, "test_mma_sp not found!"
-    assert 'sparse_prune_compress' in funcs, "sparse_prune_compress not found!"
-    print("  PASS: Compilation successful")
-    return mod
+    for name in ("test_mma_sp", "sparse_prune_compress",
+                 "sparse_prune_and_pack", "sparse_int8_linear"):
+        assert name in funcs, f"{name} not found!"
 
 
 def test_instruction_runs(mod):
@@ -123,20 +133,8 @@ def test_instruction_runs(mod):
     expected_val = 16
     C_ref = torch.full((16, 8), expected_val, dtype=torch.int32)
 
-    if torch.equal(C.cpu(), C_ref):
-        print(f"  PASS: All elements = {expected_val} (matches reference)")
-    else:
-        print(f"  NOTE: Result doesn't match uniform reference (expected all {expected_val})")
-        print(f"  This is expected if metadata layout needs tuning.")
-        print(f"  Key check: no CUDA error / illegal instruction = PTX instruction works!")
-        # Check if any values are non-zero (instruction produced output)
-        if C.abs().sum().item() > 0:
-            print(f"  PARTIAL PASS: Instruction executed, produced non-zero output")
-            print(f"  Sum = {C.sum().item()}, expected sum = {expected_val * 16 * 8}")
-        else:
-            print(f"  WARNING: All zeros - instruction may not be executing correctly")
-
-    return C
+    assert torch.equal(C.cpu(), C_ref), (
+        f"expected all elements = {expected_val}, got sum {C.sum().item()}")
 
 
 def test_correctness(mod):
@@ -178,18 +176,8 @@ def test_correctness(mod):
     print(f"  C (mma.sp):\n{C.cpu()}")
     print(f"  C_ref (dense matmul):\n{C_ref}")
 
-    if torch.equal(C.cpu(), C_ref):
-        print("  PASS: Exact match with reference!")
-    else:
-        diff = (C.cpu() - C_ref).abs()
-        print(f"  MISMATCH: max diff = {diff.max().item()}")
-        print(f"  Diff matrix:\n{diff}")
-        # Check which rows/cols are off
-        wrong = (diff > 0).nonzero()
-        if len(wrong) <= 10:
-            for idx in wrong:
-                r, c = idx[0].item(), idx[1].item()
-                print(f"    [{r},{c}]: got {C[r,c].item()}, expected {C_ref[r,c].item()}")
+    diff = (C.cpu() - C_ref).abs()
+    assert torch.equal(C.cpu(), C_ref), f"mismatch: max diff = {diff.max().item()}"
 
 
 def test_prune_compress(mod):
@@ -220,19 +208,13 @@ def test_prune_compress(mod):
             expected_comp[row, g * 2 + 0] = 10
             expected_comp[row, g * 2 + 1] = 20
 
-    if torch.equal(comp.cpu(), expected_comp):
-        print("  PASS: Compressed values correct")
-    else:
-        print("  FAIL: Compressed values mismatch")
+    assert torch.equal(comp.cpu(), expected_comp), "compressed values mismatch"
 
     # Check metadata nibbles: keep positions 0,1 -> nibble = 0 | (1 << 2) = 0x4
     meta_vals = meta_raw.cpu()
     all_correct = all(meta_vals[i].item() == 0x4 for i in range(meta_vals.numel()))
     print(f"  Metadata nibbles: {[hex(x.item()) for x in meta_vals]}")
-    if all_correct:
-        print("  PASS: Metadata nibbles correct (all 0x4)")
-    else:
-        print("  FAIL: Metadata nibbles incorrect")
+    assert all_correct, "metadata nibbles should all be 0x4"
 
 
 def test_random_data(mod):
@@ -316,17 +298,10 @@ def test_random_data(mod):
     print(f"  C (mma.sp) [0:4, :]:\n{C.cpu()[0:4, :]}")
     print(f"  C_ref      [0:4, :]:\n{C_ref[0:4, :]}")
 
-    if torch.equal(C.cpu(), C_ref):
-        print("  PASS: Exact match with reference (random data)!")
-    else:
-        diff = (C.cpu() - C_ref).abs()
-        print(f"  MISMATCH: max diff = {diff.max().item()}")
-        wrong = (diff > 0).nonzero()
-        print(f"  Wrong elements: {len(wrong)}/{16*8}")
-        if len(wrong) <= 5:
-            for idx in wrong:
-                r, c = idx[0].item(), idx[1].item()
-                print(f"    [{r},{c}]: got {C[r,c].item()}, expected {C_ref[r,c].item()}")
+    diff = (C.cpu() - C_ref).abs()
+    n_wrong = int((diff > 0).sum().item())
+    assert torch.equal(C.cpu(), C_ref), (
+        f"mismatch: max diff = {diff.max().item()}, wrong elements {n_wrong}/{16*8}")
 
 
 def test_tiled_gemm_small(mod):
@@ -393,10 +368,8 @@ def test_tiled_gemm_small(mod):
     print(f"  Max rel error: {max_rel:.4f} ({max_rel*100:.2f}%)")
     print(f"  Mean rel error: {mean_rel:.6f} ({mean_rel*100:.4f}%)")
 
-    if max_rel < 0.05 and mean_rel < 0.02:
-        print("  PASS: Tiled GEMM matches reference (within fp16 tolerance)")
-    else:
-        print("  FAIL: Tiled GEMM output differs too much from reference")
+    assert max_rel < 0.05, f"max rel error {max_rel:.4f}"
+    assert mean_rel < 0.02, f"mean rel error {mean_rel:.6f}"
 
 
 def test_tiled_gemm_unet(mod):
@@ -434,17 +407,13 @@ def test_tiled_gemm_unet(mod):
         # Empty bias
         bias = torch.empty(0, dtype=torch.float16, device='cuda')
 
-        try:
-            y = mod.sparse_int8_linear(x, w_comp, w_meta, w_scale, bias)
-            print(f"    Output: {y.shape}, dtype={y.dtype}")
-            print(f"    Range: [{y.min().item():.2f}, {y.max().item():.2f}]")
-            nan_count = y.isnan().sum().item()
-            if nan_count > 0:
-                print(f"    WARNING: {nan_count} NaN values!")
-            else:
-                print(f"    PASS: No NaN, no crash")
-        except Exception as e:
-            print(f"    FAIL: {e}")
+        y = mod.sparse_int8_linear(x, w_comp, w_meta, w_scale, bias)
+        print(f"    Output: {y.shape}, dtype={y.dtype}")
+        print(f"    Range: [{y.min().item():.2f}, {y.max().item():.2f}]")
+        assert y.shape == (M, N_out)
+        assert y.dtype == torch.float16
+        nan_count = y.isnan().sum().item()
+        assert nan_count == 0, f"{nan_count} NaN values for M={M}, N={N_out}, K={K}"
 
 
 def test_tiled_gemm_correctness(mod):
@@ -524,16 +493,8 @@ def test_tiled_gemm_correctness(mod):
 
     # Tolerance: quantization noise scales with K (each off-by-1 int8 * weight ~40 * scale)
     # For K=128: max abs diff ~20 is expected. Mean relative ~2% is fine.
-    if max_diff < 30 and mean_rel < 0.03:
-        print("  PASS: Tiled GEMM matches reference (within quantization tolerance)")
-    else:
-        print(f"  FAIL: Errors too large")
-        bad = diff.flatten().topk(5)
-        for i, idx in enumerate(bad.indices):
-            r, c = idx.item() // N_out, idx.item() % N_out
-            print(f"    [{r},{c}]: got {y_cpu[r,c].item():.2f}, "
-                  f"expected {y_expected[r,c].item():.2f}, "
-                  f"diff {diff[r,c].item():.2f}")
+    assert max_diff < 30, f"max abs diff {max_diff:.2f}"
+    assert mean_rel < 0.03, f"mean rel error {mean_rel:.6f}"
 
 
 def benchmark_sparse_vs_dense(mod):
@@ -620,8 +581,7 @@ def test_int8linear_sparse_integration():
     from python.quantize_utils import Int8Linear, quantize_model_sparse, sp_available
 
     if not sp_available():
-        print("  SKIP: Sparse TC module not available")
-        return
+        pytest.skip("Sparse TC module not available")
 
     # Test 1: from_linear_sparse on a single layer
     print("\n  --- Test 1: from_linear_sparse ---")
@@ -691,28 +651,13 @@ def test_int8linear_sparse_integration():
     for name, m in model.named_modules():
         if isinstance(m, Int8Linear):
             print(f"  {name}: {m.extra_repr()}")
+            assert m.mode == "sparse"
 
 
 if __name__ == "__main__":
-    print(f"PyTorch: {torch.__version__}")
-    print(f"CUDA available: {torch.cuda.is_available()}")
-    if torch.cuda.is_available():
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"Compute capability: {torch.cuda.get_device_capability(0)}")
-    print()
-
-    mod = test_compile()
-    test_prune_compress(mod)
-    test_instruction_runs(mod)
-    test_correctness(mod)
-    test_random_data(mod)
-    test_tiled_gemm_correctness(mod)
-    test_tiled_gemm_small(mod)
-    test_tiled_gemm_unet(mod)
-    benchmark_sparse_vs_dense(mod)
-    test_int8linear_sparse_integration()
-
-    print()
-    print("=" * 60)
-    print("All tests complete.")
-    print("=" * 60)
+    if "--bench" in sys.argv:
+        from csrc.build import load_sparse_tc
+        print(f"PyTorch: {torch.__version__}  GPU: {torch.cuda.get_device_name(0)}")
+        benchmark_sparse_vs_dense(load_sparse_tc())
+    else:
+        sys.exit(pytest.main([__file__, "-v"]))
