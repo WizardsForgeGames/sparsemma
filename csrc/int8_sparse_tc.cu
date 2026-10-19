@@ -449,7 +449,8 @@ __global__ void pack_metadata_kernel(
 //    BLOCK_WR_T: 128 (standard) or 256 (tall tile, higher arithmetic intensity)
 //    BLOCK_BC_T: 64 (narrow) or 128 (wide) batch columns
 //  3-stage cp.async pipeline: two tiles prefetched ahead of compute for better
-//  latency hiding. L2 CTA swizzle reorders blocks for better cache reuse.
+//  latency hiding. Persistent CTAs (one per SM) walk tiles in M-fastest order;
+//  tile shape and split-K come from the cost model in sparse_int8_gemm.
 //
 //  Grid: (ceil(N_out/BLOCK_WR_T), ceil(M/BLOCK_BC_T))
 // ═══════════════════════════════════════════════════════════════════════════════

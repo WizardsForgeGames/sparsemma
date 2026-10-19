@@ -1,0 +1,86 @@
+SparseMMA benchmark after the 2026-10-19 optimization campaign
+Date:     2026-10-19
+GPU:      NVIDIA GeForce RTX 4090 (sm_89)
+Software: PyTorch 2.8.0+cu126, CUDA 12.6, Windows 11, torchao 0.7.0
+Code:     sparsemma main after commit 338133d (+ README/results commit)
+Baseline: results/rtx4090_2026-10-19.txt (same day, before the campaign)
+
+== 1. tests/bench_kernels.py --rounds 3  (primary; GPU time only)
+Timing: each call captured n times in a CUDA graph (one replay >= 0.2 ms), 100 warmup + 300 timed replays,
+events back-to-back, per-call = median / n; 3 rounds, median of rounds (spread printed by the script).
+TOPS: dense-equivalent 2*M*K*N / time. quant = activation quantize kernel alone; sp GEMM = sparse GEMM +
+dequant/bias epilogue on pre-quantized int8 inputs (fp16 out); sp layer = Int8Linear forward (quant + GEMM);
+_int_mm = cuBLASLt dense INT8 GEMM (int32 out, no quantize/dequant); fp16 = nn.Linear FP16 (cuBLAS).
+
+PyTorch 2.8.0+cu126 | CUDA 12.6 | NVIDIA GeForce RTX 4090
+      K x N     M |            quant |          sp GEMM |         sp layer |          _int_mm |             fp16
+----------------------------------------------------------------------------------------------------------------
+ 1536x6144     64 |   0.0019ms       |   0.0082ms  147T |   0.0098ms  123T |   0.0061ms  197T |   0.0131ms   93T
+ 1536x6144   1024 |   0.0041ms       |   0.0408ms  474T |   0.0430ms  449T |   0.0659ms  293T |   0.1167ms  166T
+ 1536x6144   4096 |   0.0056ms       |   0.1423ms  543T |   0.1567ms  493T |   0.1951ms  396T |   0.4577ms  169T
+ 1536x6144   8192 |   0.0098ms       |   0.2877ms  537T |   0.3185ms  486T |   0.3799ms  407T |   0.9298ms  166T
+ 6144x1536     64 |   0.0017ms       |   0.0108ms  112T |   0.0126ms   96T |   0.0126ms   96T |   0.0130ms   93T
+ 6144x1536   1024 |   0.0052ms       |   0.0387ms  499T |   0.0442ms  437T |   0.0686ms  282T |   0.1239ms  156T
+ 6144x1536   4096 |   0.0257ms       |   0.1444ms  535T |   0.2099ms  368T |   0.2540ms  304T |   0.4884ms  158T
+ 6144x1536   8192 |   0.1372ms       |   0.2652ms  583T |   0.3994ms  387T |   0.2703ms  572T |   0.9626ms  161T
+ 1280x5120     64 |   0.0024ms       |   0.0070ms  120T |   0.0089ms   95T |   0.0053ms  159T |   0.0143ms   59T
+ 1280x5120   1024 |   0.0033ms       |   0.0310ms  433T |   0.0331ms  405T |   0.0481ms  279T |   0.0881ms  152T
+ 1280x5120   4096 |   0.0050ms       |   0.1070ms  502T |   0.1132ms  474T |   0.1449ms  371T |   0.3205ms  168T
+ 1280x5120   8192 |   0.0086ms       |   0.2130ms  504T |   0.2437ms  441T |   0.2816ms  381T |   0.6502ms  165T
+ 5120x1280     64 |   0.0028ms       |   0.0090ms   93T |   0.0109ms   77T |   0.0108ms   77T |   0.0109ms   77T
+ 5120x1280   1024 |   0.0046ms       |   0.0328ms  410T |   0.0371ms  362T |   0.0563ms  238T |   0.0901ms  149T
+ 5120x1280   4096 |   0.0131ms       |   0.1044ms  514T |   0.1270ms  423T |   0.1756ms  306T |   0.3359ms  160T
+ 5120x1280   8192 |   0.1157ms       |   0.1981ms  542T |   0.3072ms  350T |   0.2150ms  499T |   0.6733ms  159T
+
+== 2. Before -> after (ms, bench_kernels protocol; baseline numbers from the step-0 run of the same script)
+
+      K x N     M | sparse GEMM before -> after | sparse layer before -> after | _int_mm | FP16
+   1536x6144   1024 | 0.1014 -> 0.0408 (2.49x) | 0.1055 -> 0.0430 (2.45x) | 0.0659 | 0.1167
+   1536x6144   4096 | 0.2744 -> 0.1423 (1.93x) | 0.2959 -> 0.1567 (1.89x) | 0.1951 | 0.4577
+   1536x6144   8192 | 0.5448 -> 0.2877 (1.89x) | 0.5939 -> 0.3185 (1.86x) | 0.3799 | 0.9298
+   6144x1536   1024 | 0.1234 -> 0.0387 (3.19x) | 0.1341 -> 0.0442 (3.03x) | 0.0686 | 0.1239
+   6144x1536   4096 | 0.2356 -> 0.1444 (1.63x) | 0.3215 -> 0.2099 (1.53x) | 0.2540 | 0.4884
+   6144x1536   8192 | 0.4721 -> 0.2652 (1.78x) | 0.6584 -> 0.3994 (1.65x) | 0.2703 | 0.9626
+   1280x5120   1024 | 0.0727 -> 0.0310 (2.35x) | 0.0765 -> 0.0331 (2.31x) | 0.0481 | 0.0881
+   1280x5120   4096 | 0.2028 -> 0.1070 (1.90x) | 0.2191 -> 0.1132 (1.94x) | 0.1449 | 0.3205
+   1280x5120   8192 | 0.4076 -> 0.2130 (1.91x) | 0.4475 -> 0.2437 (1.84x) | 0.2816 | 0.6502
+   5120x1280   1024 | 0.1039 -> 0.0328 (3.17x) | 0.1132 -> 0.0371 (3.05x) | 0.0563 | 0.0901
+   5120x1280   4096 | 0.1997 -> 0.1044 (1.91x) | 0.2396 -> 0.1270 (1.89x) | 0.1756 | 0.3359
+   5120x1280   8192 | 0.3318 -> 0.1981 (1.67x) | 0.4987 -> 0.3072 (1.62x) | 0.2150 | 0.6733
+   1536x6144     64 | 0.0143 -> 0.0082 (1.74x) | 0.0164 -> 0.0098 (1.67x) | 0.0061 | 0.0131
+   5120x1280     64 | 0.0109 -> 0.0090 (1.21x) | 0.0151 -> 0.0109 (1.39x) | 0.0108 | 0.0109
+
+== 3. tests/bench_vs_dense_int8.py  (per-call CUDA events, median of 100 after 20 warmup, one round;
+   includes host launch overhead at small sizes; same script and protocol as the baseline file)
+
+PyTorch 2.8.0+cu126 | CUDA 12.6 | NVIDIA GeForce RTX 4090
+sparse available: True  dense-TC available: True
+      K x N     M | FP16 cuBLAS | SparseMMA layer | own dense TC | _int_mm GEMM | INT8 e2e torch
+------------------------------------------------------------------------------------------------
+ 1536x6144   1024 |  0.159ms  122T |   0.081ms  239T |  0.170ms  114T |  0.095ms  203T |  0.387ms   50T
+ 1536x6144   4096 |  0.499ms  155T |   0.180ms  429T |  0.466ms  166T |  0.201ms  385T |  1.392ms   56T
+ 1536x6144   8192 |  0.958ms  161T |   0.353ms  438T |  0.920ms  168T |  0.408ms  379T |  3.251ms   48T
+ 6144x1536   1024 |  0.175ms  110T |   0.082ms  236T |  0.205ms   94T |  0.101ms  191T |  0.408ms   47T
+ 6144x1536   4096 |  0.518ms  149T |   0.241ms  321T |  0.538ms  144T |  0.272ms  284T |  1.853ms   42T
+ 6144x1536   8192 |  0.968ms  160T |   0.430ms  359T |  1.058ms  146T |  0.293ms  528T |  3.659ms   42T
+ 1280x5120   1024 |  0.132ms  102T |   0.076ms  176T |  0.148ms   90T |  0.078ms  172T |  0.393ms   34T
+ 1280x5120   4096 |  0.356ms  151T |   0.148ms  362T |  0.315ms  170T |  0.175ms  307T |  1.159ms   46T
+ 1280x5120   8192 |  0.680ms  158T |   0.273ms  394T |  0.673ms  160T |  0.304ms  353T |  2.310ms   46T
+ 5120x1280   1024 |  0.142ms   94T |   0.075ms  178T |  0.176ms   76T |  0.089ms  151T |  0.398ms   34T
+ 5120x1280   4096 |  0.372ms  144T |   0.162ms  332T |  0.380ms  141T |  0.201ms  267T |  1.487ms   36T
+ 5120x1280   8192 |  0.706ms  152T |   0.341ms  315T |  0.803ms  134T |  0.243ms  442T |  3.011ms   36T
+
+== 4. tests/bench_vs_torchao.py  (per-call events, median of 200 after 30 warmup, 3 interleaved rounds;
+   err = relative error vs the dense FP16 layer on random weights; sparsemma's 0.447 is the 2:4 pruning)
+   torchao at 5120x1280 takes 4-5 ms (8-15x its own other shapes) and is excluded from comparisons, as in the
+   earlier README comparison, which counted 6 valid shape/batch pairs.
+
+torch 2.8.0+cu126 | torchao 0.7.0 | NVIDIA GeForce RTX 4090
+1536x6144 M=4096: fp16=0.499ms[0.494-0.545] err=0.000  fp16_compiled=0.604ms[0.603-0.629] err=0.000  torchao_int8_compiled=0.516ms[0.515-0.516] err=0.009  sparsemma=0.181ms[0.181-0.182] err=0.447
+1536x6144 M=8192: fp16=0.983ms[0.974-1.001] err=0.000  fp16_compiled=1.058ms[1.041-1.060] err=0.000  torchao_int8_compiled=0.921ms[0.920-0.927] err=0.009  sparsemma=0.347ms[0.342-0.347] err=0.447
+6144x1536 M=4096: fp16=0.522ms[0.521-0.853] err=0.000  fp16_compiled=0.582ms[0.575-0.583] err=0.000  torchao_int8_compiled=0.421ms[0.419-0.422] err=0.010  sparsemma=0.240ms[0.238-0.241] err=0.447
+6144x1536 M=8192: fp16=1.008ms[1.001-1.010] err=0.000  fp16_compiled=1.071ms[1.068-1.073] err=0.000  torchao_int8_compiled=0.646ms[0.645-0.657] err=0.010  sparsemma=0.459ms[0.458-0.460] err=0.447
+1280x5120 M=4096: fp16=0.360ms[0.359-0.360] err=0.000  fp16_compiled=0.429ms[0.428-0.431] err=0.000  torchao_int8_compiled=0.465ms[0.463-0.465] err=0.009  sparsemma=0.149ms[0.148-0.149] err=0.447
+1280x5120 M=8192: fp16=0.693ms[0.691-0.703] err=0.000  fp16_compiled=0.763ms[0.761-0.766] err=0.000  torchao_int8_compiled=0.761ms[0.759-0.762] err=0.009  sparsemma=0.271ms[0.265-0.273] err=0.447
+5120x1280 M=4096: fp16=0.372ms[0.371-0.373] err=0.000  fp16_compiled=0.412ms[0.410-0.414] err=0.000  torchao_int8_compiled=4.013ms[4.008-4.080] err=0.010  sparsemma=0.162ms[0.162-0.163] err=0.447
+5120x1280 M=8192: fp16=0.710ms[0.708-0.710] err=0.000  fp16_compiled=0.755ms[0.754-0.757] err=0.000  torchao_int8_compiled=5.231ms[5.159-5.232] err=0.010  sparsemma=0.339ms[0.339-0.340] err=0.447
