@@ -42,6 +42,7 @@
 
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
@@ -77,8 +78,8 @@ __device__ __forceinline__ void cp_async_16(void* dst_smem, const void* src_gmem
     );
 }
 
-// L2 evict-first: use for one-shot data (activations/B tiles) that won't be
-// reloaded. Frees L2 capacity for weight/A tiles reused across M-waves.
+// cp.async.cg: caches in L2 only and bypasses L1 (it sets no eviction priority).
+// Used for streamed data (activations/B tiles) that won't be re-read from L1.
 __device__ __forceinline__ void cp_async_16_stream(void* dst_smem, const void* src_gmem) {
     uint32_t dst_addr = static_cast<uint32_t>(__cvta_generic_to_shared(dst_smem));
     asm volatile(
@@ -1427,7 +1428,8 @@ torch::Tensor sparse_int8_linear(
     // Split-K: when spatial tiles are too few to fill all SMs, split the K
     // dimension across multiple CTAs. Each CTA computes a partial result
     // and atomicAdds it into an fp32 workspace. A reduce kernel finalizes.
-    constexpr int SP_MAX_CTAS = 128;  // RTX 4090 has 128 SMs
+    // One persistent CTA per SM, queried from the device (128 on an RTX 4090).
+    const int SP_MAX_CTAS = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
     constexpr int SP_SPLITK_TILE_THRESHOLD = 64;  // use split-K below this
     constexpr int SP_MAX_SPLIT_K = 32;
 
@@ -1452,7 +1454,9 @@ torch::Tensor sparse_int8_linear(
     constexpr int SP_MIN_K_PER_SPLIT = 4;  // each split needs ≥4 iters for pipeline
     int split_k = 1;
     if (spatial_tiles < SP_SPLITK_TILE_THRESHOLD && k_iters_total >= 8) {
-        split_k = (SP_MAX_CTAS + spatial_tiles - 1) / spatial_tiles;
+        // Round down so spatial_tiles * split_k stays within one wave of CTAs
+        // (rounding up could launch a second, mostly idle wave).
+        split_k = SP_MAX_CTAS / spatial_tiles;
         // Ensure each split gets enough K-iterations for the pipeline
         const int max_by_k = k_iters_total / SP_MIN_K_PER_SPLIT;
         if (split_k > max_by_k) split_k = max_by_k;
