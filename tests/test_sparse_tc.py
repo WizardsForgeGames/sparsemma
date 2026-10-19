@@ -654,6 +654,35 @@ def test_int8linear_sparse_integration():
             assert m.mode == "sparse"
 
 
+def test_quantize_model_sparse_skips_unaligned_k():
+    """quantize_model_sparse must leave layers with K % 64 != 0 as FP16 nn.Linear.
+
+    K=672 passes the K >= 640 threshold and the prune kernel's K % 32 check, but the
+    sparse GEMM needs K % 64 == 0. Converting it used to crash on forward.
+    """
+    from python.quantize_utils import Int8Linear, quantize_model_sparse, sp_available
+
+    if not sp_available():
+        pytest.skip("Sparse TC module not available")
+
+    torch.manual_seed(0)
+    model = torch.nn.Sequential(
+        torch.nn.Linear(672, 1280, bias=True),   # K % 64 == 32 -> must stay FP16
+        torch.nn.ReLU(),
+        torch.nn.Linear(1280, 1280, bias=True),  # aligned -> sparse
+    ).cuda().half()
+
+    stats = quantize_model_sparse(model, verbose=False)
+    assert stats["num_replaced"] == 1
+    assert stats["kept_fp16"] == 1
+    assert type(model[0]) is torch.nn.Linear
+    assert isinstance(model[2], Int8Linear) and model[2].mode == "sparse"
+
+    y = model(torch.randn(64, 672, dtype=torch.float16, device="cuda"))
+    assert y.shape == (64, 1280)
+    assert not y.isnan().any()
+
+
 if __name__ == "__main__":
     if "--bench" in sys.argv:
         from csrc.build import load_sparse_tc

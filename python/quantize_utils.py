@@ -313,7 +313,8 @@ def quantize_model_sparse(model, min_features=128, sparse_min_k=640, verbose=Tru
         saved_mb = fp16_mb - sparse_mb
         print(f"  Quantized {stats['num_replaced']} Linear layers -> sparse Int8Linear")
         print(f"  Sparse-eligible: {stats['sparse_eligible']} layers")
-        print(f"  Kept as FP16: {stats['kept_fp16']} layers (K < {sparse_min_k})")
+        print(f"  Kept as FP16: {stats['kept_fp16']} layers "
+              f"(K < {sparse_min_k}, K % 64 != 0, or N % 16 != 0)")
         print(f"  Estimated VRAM saved: ~{saved_mb:.0f} MB (vs FP16)")
 
     return stats
@@ -327,7 +328,12 @@ def _replace_linear_sparse(module, min_features, sparse_min_k, stats):
 
             if child.in_features < min_features or child.out_features < min_features:
                 stats["skipped_params"] += num_params
-            elif child.in_features < sparse_min_k:
+            elif (child.in_features < sparse_min_k
+                  or child.in_features % 64 != 0
+                  or child.out_features % 16 != 0):
+                # The sparse kernel needs K % 64 == 0 and N % 16 == 0. A sparse Int8Linear
+                # with any other shape would fall through to the dequant path, which has
+                # no dense weights in sparse mode, so keep these layers as FP16.
                 stats["kept_fp16"] += 1
             else:
                 int8_layer = Int8Linear.from_linear_sparse(child)
