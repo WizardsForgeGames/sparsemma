@@ -599,18 +599,18 @@ __device__ __forceinline__ void sparse_gemm_impl(
             LOAD_TILE(s * SMEM_PER_STAGE, k_start_iter + s);
 
     // ── Per-lane ldmatrix / metadata offsets within a stage ──
-    // A (x2): lane L addresses row warp_wr + (L & 15); +16 rows per M-tile keeps the
-    //   swizzle phase, so M-tile mi is +mi*16*SP_K_COMP; the second K-half is ^16.
-    // B (x2): lane L addresses row warp_bc + (L & 7), K chunk ((L >> 3) & 1); +8 rows per
-    //   N-tile keeps the swizzle phase (+nj*8*SP_BLOCK_K); K[32:63] is ^32.
+    // A (x4): lane L addresses row warp_wr + (L & 15), K_comp half (L >> 4); +16 rows per
+    //   M-tile keeps the swizzle phase, so M-tile mi is +mi*16*SP_K_COMP.
+    // B (x4): lane L addresses row warp_bc + (L & 7), 16-byte K chunk (L >> 3); +8 rows per
+    //   N-tile keeps the swizzle phase (+nj*8*SP_BLOCK_K).
     // Metadata: lane (g, tid) reads row warp_wr + g + 8*(tid&1), word tid>>1.
     const uint32_t a_ldm_off = [&] {
         const int row = warp_wr + (lane & 15);
-        return (uint32_t)(row * SP_K_COMP + a_swiz(row, 0));
+        return (uint32_t)(row * SP_K_COMP + a_swiz(row, (lane >> 4) << 4));
     }();
     const uint32_t b_ldm_off = [&] {
         const int row = warp_bc + (lane & 7);
-        return (uint32_t)(SMEM_A_STAGE + row * SP_BLOCK_K + b_swiz(row, ((lane >> 3) & 1) << 4));
+        return (uint32_t)(SMEM_A_STAGE + row * SP_BLOCK_K + b_swiz(row, (lane >> 3) << 4));
     }();
     const uint32_t m_ldm_off = SMEM_A_STAGE + SMEM_B_STAGE
         + (uint32_t)((warp_wr + groupID + ((tid & 1) << 3)) * 8 + (tid >> 1) * 4);
@@ -658,36 +658,25 @@ __device__ __forceinline__ void sparse_gemm_impl(
         // ── Per-warp MMA computation ──
         // All TILES_M A fragments are loaded once per K step and held in registers; the
         // N-tile loop is outermost so each B fragment is loaded exactly once and reused
-        // across the warp's TILES_M M-tiles: 2*TILES_M + 2*TILES_N ldmatrix.x2 per K step.
+        // across the warp's TILES_M M-tiles: TILES_M + TILES_N ldmatrix.x4 per K step.
         uint32_t a_frag0[TILES_M][2], a_frag1[TILES_M][2];
         #pragma unroll
         for (int mi = 0; mi < TILES_M; mi++) {
-            const uint32_t a_addr = cur + a_ldm_off + mi * 16 * SP_K_COMP;
             asm volatile(
-                "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                : "=r"(a_frag0[mi][0]), "=r"(a_frag0[mi][1])
-                : "r"(a_addr)
-            );
-            asm volatile(
-                "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                : "=r"(a_frag1[mi][0]), "=r"(a_frag1[mi][1])
-                : "r"(a_addr ^ 16u)
+                "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                : "=r"(a_frag0[mi][0]), "=r"(a_frag0[mi][1]),
+                  "=r"(a_frag1[mi][0]), "=r"(a_frag1[mi][1])
+                : "r"(cur + a_ldm_off + mi * 16 * SP_K_COMP)
             );
         }
 
         #pragma unroll
         for (int nj = 0; nj < TILES_N; nj++) {
-            const uint32_t b_addr = cur + b_ldm_off + nj * 8 * SP_BLOCK_K;
             uint32_t b_frag0[2], b_frag1[2];
             asm volatile(
-                "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                : "=r"(b_frag0[0]), "=r"(b_frag0[1])
-                : "r"(b_addr)
-            );
-            asm volatile(
-                "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                : "=r"(b_frag1[0]), "=r"(b_frag1[1])
-                : "r"(b_addr ^ 32u)
+                "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                : "=r"(b_frag0[0]), "=r"(b_frag0[1]), "=r"(b_frag1[0]), "=r"(b_frag1[1])
+                : "r"(cur + b_ldm_off + nj * 8 * SP_BLOCK_K)
             );
 
             #pragma unroll
